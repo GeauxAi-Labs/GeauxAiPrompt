@@ -1,64 +1,206 @@
-# MentraOS-Display-Example-App
+# ⬡ GeauxAiPrompt
 
-### Install MentraOS on your phone
+**Voice AI assistant for the Even Realities G1 smart glasses, built on MentraOS.**
 
-MentraOS install links: [mentra.glass/install](https://mentra.glass/install)
+Talk to your glasses. See the AI response appear right in front of your eyes. A live chat log streams to your phone via a zero-JavaScript WebView — no app install required.
 
-### (Easiest way to get started) Set up ngrok
+---
 
-1. `brew install ngrok`
+## Screenshots
 
-2. Make an ngrok account
+### Working UI — Connected, Mic On, New Chat
 
-3. [Use ngrok to make a static address/URL](https://dashboard.ngrok.com/)
+![GeauxAiPrompt UI](docs/screenshot_ui.png)
 
-### Register your App with MentraOS
+> Header shows live connection status, mic toggle, and new chat reset. Conversation streams live from glasses to phone.
 
-1. Navigate to [console.mentra.glass](https://console.mentra.glass/)
+---
 
-2. Click "Sign In", and log in with the same account you're using for MentraOS
+## Features
 
-3. Click "Create App"
+- **Always-on voice** — mic stays active, just speak into your G1 glasses
+- **Live chat log** — conversation streams to your phone's WebView in real time
+- **Multi-page AI responses** — long answers paginate automatically on the glasses display
+- **🎤 MIC ON / 🔇 MIC OFF toggle** — mute/unmute the mic from your phone without stopping the app
+- **✕ NEW CHAT** — clear conversation history instantly from your phone
+- **Multi-provider AI** — works with Ollama (local/offline), OpenAI, or Anthropic
+- **Zero JavaScript WebView** — uses `<meta http-equiv="refresh">` for live updates; works in any restricted WebView
+- **Session expiry handling** — graceful "Session Expired" page instead of a crash loop after ~3 hours
+- **Offline capable** — run fully local with Ollama, no cloud AI dependency
 
-4. Set a unique package name like `com.yourName.yourAppName`
+---
 
-5. For "Public URL", enter your Ngrok's static URL
+## Architecture
 
-6. In the edit app screen, add the microphone permission
+```
+Even Realities G1 glasses
+        │  (voice via MentraOS cloud)
+        ▼
+  MentraOS SDK (WebSocket)
+        │
+        ▼
+  GeauxAiPrompt server (Bun + TypeScript + Express)
+        │  ├── onTranscription → Ollama/OpenAI/Anthropic → showTextWall (glasses)
+        │  └── /webview → meta-refresh HTML → phone browser
+        ▼
+  Phone WebView (live chat log)
+```
 
-### Get your App running!
+**Key design decision:** The WebView uses zero JavaScript — no fetch, no EventSource, no WebSocket. A `<meta http-equiv="refresh" content="4">` tag reloads the page every 4 seconds with the latest conversation baked into the HTML server-side. This works in MentraOS's restricted WebView environment where JavaScript APIs may be blocked.
 
-1. [Install bun](https://bun.sh/docs/installation)
+---
 
-2. Create a new repo from this template using the `Use this template` dropdown in the upper right or the following command: `gh repo create --template Mentra-Community/MentraOS-Cloud-Example-App`
+## Stack
 
-    ![Create repo from template](https://github.com/user-attachments/assets/c10e14e8-2dc5-4dfa-adac-dd334c1b73a5)
+| Component | Technology |
+|-----------|-----------|
+| Runtime | [Bun](https://bun.sh) |
+| Language | TypeScript |
+| Framework | Express (via MentraOS SDK) |
+| Glasses SDK | [@mentra/sdk](https://docs.mentra.glass) |
+| AI (default) | [Ollama](https://ollama.ai) — local inference |
+| AI (optional) | OpenAI, Anthropic |
 
-3. Clone your new repo locally: `git clone <your-repo-url>`
+---
 
-4. cd into your repo, then type `bun install`
+## Requirements
 
-5. Set up your environment variables:
-   * Create a `.env` file in the root directory by copying the example: `cp .env.example .env`
-   * Edit the `.env` file with your app details:
-     ```
-     PORT=3000
-     PACKAGE_NAME=com.yourName.yourAppName
-     MENTRAOS_API_KEY=your_api_key_from_console
-     ```
-   * Make sure the `PACKAGE_NAME` matches what you registered in the MentraOS Console
-   * Get your `API_KEY` from the MentraOS Developer Console
+- [Bun](https://bun.sh) v1.0+
+- A [MentraOS developer account](https://developers.mentra.glass) and API key
+- Even Realities G1 smart glasses with the Mentra app installed
+- [Ollama](https://ollama.ai) running locally (or OpenAI/Anthropic API key)
+- [ngrok](https://ngrok.com) or similar tunnel to expose your local server
 
-6. Run your app with `bun run dev`
+---
 
-7. To expose your app to the internet (and thus MentraOS) with ngrok, run: `ngrok http --url=<YOUR_NGROK_URL_HERE> 3000`
-    * `3000` is the port. It must match what is in the app config. For example, if you entered `port: 8080`, use `8080` for ngrok instead.
+## Setup
 
+### 1. Clone the repo
 
-### Next Steps
+```bash
+git clone https://github.com/YOUR_USERNAME/GeauxAiPrompt.git
+cd GeauxAiPrompt
+```
 
-Check out the full documentation at [docs.mentra.glass](https://docs.mentra.glass/core-concepts)
+### 2. Install dependencies
 
-#### Subscribing to events
+```bash
+bun install
+```
 
-You can listen for transcriptions, translations, and other events within the onSession function.
+### 3. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` — see the section below for what each variable means.
+
+### 4. Pull your AI model (if using Ollama)
+
+```bash
+ollama pull llama3.2
+```
+
+### 5. Expose your server with ngrok
+
+```bash
+ngrok http 3000
+```
+
+Copy the `https://` URL — you'll need it when registering your app in the MentraOS developer portal.
+
+### 6. Register your app on MentraOS
+
+Go to [developers.mentra.glass](https://developers.mentra.glass), create an app, and set the webhook URL to your ngrok URL.
+
+### 7. Run
+
+```bash
+bun run dev
+```
+
+Open the Mentra app on your phone, launch GeauxAiPrompt, and tap the WebView link to open the chat log.
+
+---
+
+## Environment Variables
+
+Edit your `.env` file after copying from `.env.example`:
+
+```env
+# Required — your MentraOS developer API key
+MENTRA_API_KEY=your_mentra_api_key_here
+
+# Required — the email address you use to log into the Mentra app
+OWNER_EMAIL=your@email.com
+
+# Required — must match your app registration in the MentraOS developer portal
+PACKAGE_NAME=com.yourname.yourappname
+
+# AI provider: ollama | openai | anthropic
+AI_PROVIDER=ollama
+
+# Model to use (depends on provider)
+AI_MODEL=llama3.2
+
+# Ollama host (only for AI_PROVIDER=ollama)
+OLLAMA_HOST=http://localhost:11434
+
+# Only needed for their respective providers
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+```
+
+> **Important:** Never commit your `.env` file. It is already listed in `.gitignore`.
+
+---
+
+## How It Works
+
+1. You speak into your G1 glasses
+2. MentraOS transcribes the audio and sends it to your server via WebSocket
+3. Your server calls the AI (Ollama by default)
+4. The AI response is sent back to the glasses via `showTextWall()` — paginated if long
+5. The response also appears in the phone WebView which auto-refreshes every 4 seconds
+6. You can mute the mic or clear history from the phone WebView at any time
+
+---
+
+## Controls
+
+| Button | Action |
+|--------|--------|
+| `🎤 MIC ON` | Tap to mute — glasses will no longer send transcriptions |
+| `🔇 MIC OFF` | Tap to unmute — resumes voice input |
+| `✕ NEW CHAT` | Clears all conversation history |
+
+---
+
+## Project Structure
+
+```
+GeauxAiPrompt/
+├── src/
+│   └── index.ts        # Main application — all server, session, and UI logic
+├── .env.example        # Environment variable template
+├── .env                # Your local config (never committed)
+├── .gitignore
+├── package.json
+├── bunfig.toml
+└── README.md
+```
+
+---
+
+## Version
+
+**v1.0 Alpha** — First fully functional release.
+
+Built by [GeauxAI Labs](https://github.com/GeauxAILabs)
+
+---
+
+## License
+
+MIT
