@@ -10,7 +10,7 @@ Talk to your glasses. See the AI response appear right in front of your eyes. A 
 
 ### Working UI — Connected, Mic On, New Chat
 
-![GeauxAiPrompt UI](docs/screenshot_ui.png)
+![GeauxAiPrompt UI](docs/screenshot_ui.png)![GeauxAiPrompt UI](docs/screenshot_ui2.png)
 
 > Header shows live connection status, mic toggle, and new chat reset. Conversation streams live from glasses to phone.
 
