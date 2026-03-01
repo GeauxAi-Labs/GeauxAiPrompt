@@ -429,11 +429,18 @@ class GeauxAIApp extends AppServer {
 
   public addRoutes() {
     const app = this.getExpressApp();
-    const owner = OWNER_EMAIL;
 
     // Required: parse urlencoded form bodies (textarea POST sends text=... urlencoded)
     // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add it here.
     app.use(require('express').urlencoded({ extended: false }));
+
+    // ── Per-request user resolver ─────────────────────────────────────────────
+    // The SDK auth middleware sets req.authUserId from the signed token on every
+    // request. We use that so each user sees their OWN conversation and state.
+    // Falls back to OWNER_EMAIL only when the webview is opened without a signed
+    // token (e.g. direct browser hit during local dev) so the owner's dev workflow
+    // is unchanged.
+    const resolveUser = (req: any): string => req.authUserId || OWNER_EMAIL;
 
     // Serve the live chat page.
     // The SDK auth middleware runs on every request and sets req.authUserId when token is valid.
@@ -451,7 +458,8 @@ class GeauxAIApp extends AppServer {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.status(401).end(EXPIRED_PAGE_HTML);
       }
-      const s = getState(owner);
+      const userId = resolveUser(req);
+      const s = getState(userId);
       // ── Refresh rate logic ────────────────────────────────────────────────
       // When mic is muted the page normally polls at 3600s (basically never)
       // so the user can type without the page reloading under their fingers.
@@ -475,7 +483,7 @@ class GeauxAIApp extends AppServer {
       }
       const refreshSecs = (s.micMuted && !activelyProcessing) ? '3600' : '4';
       const html = buildPage(
-        activeSessions.has(owner),
+        activeSessions.has(userId),
         s.isProcessing,
         s.history,
         s.micMuted,
@@ -490,13 +498,14 @@ class GeauxAIApp extends AppServer {
     // Clears server-side history, notifies glasses if connected,
     // then redirects back so the browser reloads a fresh empty page.
     app.post('/clear', async (req: any, res: any) => {
-      const s = getState(owner);
+      const userId = resolveUser(req);
+      const s = getState(userId);
       s.history = [];
       s.lastResponse = '';
       s.pages = [];
       s.pageIndex = 0;
-      console.log('[WebClear] History cleared via New Chat button');
-      const session = activeSessions.get(owner);
+      console.log(`[WebClear] History cleared for ${userId}`);
+      const session = activeSessions.get(userId);
       if (session) {
         try { await session.layouts.showTextWall('History cleared.\nReady for new prompts.'); } catch {}
       }
@@ -504,10 +513,11 @@ class GeauxAIApp extends AppServer {
     });
 
     app.post('/mic', async (req: any, res: any) => {
-      const s = getState(owner);
+      const userId = resolveUser(req);
+      const s = getState(userId);
       s.micMuted = !s.micMuted;
-      console.log(`[MicToggle] micMuted=${s.micMuted}`);
-      const session = activeSessions.get(owner);
+      console.log(`[MicToggle] ${userId} micMuted=${s.micMuted}`);
+      const session = activeSessions.get(userId);
       if (session) {
         const msg = s.micMuted ? 'Microphone muted.\nTap MIC ON in the app to resume.' : 'Microphone active.\nSpeak into your glasses.';
         try { await session.layouts.showTextWall(msg); } catch {}
@@ -518,19 +528,20 @@ class GeauxAIApp extends AppServer {
     app.post('/prompt', async (req: any, res: any) => {
       const text = req.body?.text?.trim();
       if (!text || text.length < 1) return res.redirect(303, '/webview');
-      const session = activeSessions.get(owner);
+      const userId = resolveUser(req);
+      const session = activeSessions.get(userId);
       if (!session) {
-        console.log('[TypePrompt] No active glasses session — ignored');
+        console.log(`[TypePrompt] No active glasses session for ${userId} — ignored`);
         return res.redirect(303, '/webview');
       }
-      const s = getState(owner);
+      const s = getState(userId);
       if (s.isProcessing) {
         console.log('[TypePrompt] Already processing — ignored');
         return res.redirect(303, '/webview');
       }
-      console.log(`[TypePrompt] "${text.substring(0, 60)}"`);
-      getState(owner).pendingRefresh = true;  // serve one 4s refresh to show AI response
-      handlePrompt(owner, text, session);     // fire-and-forget
+      console.log(`[TypePrompt] ${userId} "${text.substring(0, 60)}"`);
+      getState(userId).pendingRefresh = true;
+      handlePrompt(userId, text, session);     // fire-and-forget
       res.redirect(303, '/webview');
     });
 
@@ -662,14 +673,13 @@ function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 // Validate required env vars before starting
-if (!OWNER_EMAIL) {
-  console.error('\n❌  OWNER_EMAIL is not set in your .env file.');
-  console.error('    Add: OWNER_EMAIL=your@email.com\n');
-  process.exit(1);
-}
 if (!API_KEY) {
   console.error('\n❌  MENTRA_API_KEY is not set in your .env file.\n');
   process.exit(1);
+}
+if (!OWNER_EMAIL) {
+  console.warn('\n⚠️   OWNER_EMAIL is not set. Webview will require a valid MentraOS auth token.');
+  console.warn('    Set OWNER_EMAIL=your@email.com in .env for local dev fallback.\n');
 }
 
 const server = new GeauxAIApp({ packageName: PACKAGE_NAME, apiKey: API_KEY, port: PORT });
