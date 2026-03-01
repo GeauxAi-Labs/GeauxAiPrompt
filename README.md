@@ -197,7 +197,7 @@ GeauxAiPrompt/
 
 **v2.0.0-beta** — Stable voice + typed prompt pipeline. All core features working.
 
-Built by [GeauxAI Labs]([https://github.com/GeauxAi-Labs])
+Built by [GeauxAI Labs](https://github.com/GeauxAi-Labs)
 
 ---
 
