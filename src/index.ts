@@ -5,7 +5,7 @@ const PORT         = parseInt(process.env.PORT || '3000');
 const PACKAGE_NAME = process.env.PACKAGE_NAME || 'com.geauxailabs.geauxaiprompt';
 const API_KEY      = process.env.MENTRA_API_KEY || '';
 const AI_PROVIDER  = process.env.AI_PROVIDER   || 'ollama';
-const AI_MODEL     = process.env.AI_MODEL      || 'llama3.2';
+const AI_MODEL     = process.env.AI_MODEL      || 'llama3.2:3b';
 const OPENAI_KEY   = process.env.OPENAI_API_KEY   || '';
 const ANTHROPIC_KEY= process.env.ANTHROPIC_API_KEY|| '';
 const OLLAMA_HOST  = process.env.OLLAMA_HOST   || 'http://localhost:11434';
@@ -14,17 +14,25 @@ const OWNER_EMAIL  = process.env.OWNER_EMAIL || '';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 interface UserState {
-  history:      { role: string; content: string }[];
-  lastResponse: string;
-  isProcessing: boolean;
-  micMuted:     boolean;
+  history:        { role: string; content: string }[];
+  lastResponse:   string;
+  isProcessing:   boolean;
+  micMuted:       boolean;
+  pendingRefresh: boolean;  // true after typed prompt — serve one 4s refresh then reset
+  // Pagination state — stored so buttons can navigate without re-running AI
+  pages:          string[];  // paginated chunks of lastResponse
+  pageIndex:      number;    // currently displayed page (0-based)
 }
 const userStates     = new Map<string, UserState>();
 const activeSessions = new Map<string, AppSession>();
 
 function getState(userId: string): UserState {
   if (!userStates.has(userId)) {
-    userStates.set(userId, { history: [], lastResponse: '', isProcessing: false, micMuted: false });
+    userStates.set(userId, {
+      history: [], lastResponse: '', isProcessing: false,
+      micMuted: false, pendingRefresh: false,
+      pages: [], pageIndex: 0
+    });
   }
   return userStates.get(userId)!;
 }
@@ -36,7 +44,7 @@ function esc(t: string): string {
 // Build the full HTML page with conversation baked in — no JS required at all.
 // The page auto-refreshes every 4 seconds via <meta http-equiv="refresh">.
 // This works in ANY WebView, any browser, zero JavaScript needed.
-function buildPage(connected: boolean, processing: boolean, history: {role:string;content:string}[], micMuted: boolean): string {
+function buildPage(connected: boolean, processing: boolean, history: {role:string;content:string}[], micMuted: boolean, refreshSecs = '4'): string {
   const statusText = processing ? '⏳ Thinking...' : connected ? '🟢 Connected — speak into your glasses' : '⚪ Waiting for glasses connection...';
   const pillClass  = processing ? 'thinking' : connected ? 'connected' : 'waiting';
   const pillLabel  = processing ? '● THINKING' : connected ? '● CONNECTED' : '● WAITING';
@@ -72,7 +80,7 @@ function buildPage(connected: boolean, processing: boolean, history: {role:strin
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta http-equiv="refresh" content="4">
+<meta id="mr" http-equiv="refresh" content="${refreshSecs}">
 <title>GeauxAiPrompt</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -130,7 +138,7 @@ header{
 .stxt{font-size:10px;color:var(--mu);font-family:monospace}
 
 .feed{
-  flex:1;padding:12px 16px 80px;
+  flex:1;padding:12px 16px 110px;
   display:flex;flex-direction:column;gap:10px;
 }
 .empty{
@@ -157,7 +165,8 @@ header{
 footer{
   position:fixed;bottom:0;left:0;right:0;
   max-width:520px;margin:0 auto;
-  padding:8px 16px 12px;
+  padding:8px 16px env(safe-area-inset-bottom, 20px);
+  padding-bottom:max(20px, env(safe-area-inset-bottom, 20px));
   border-top:1px solid var(--bd);
   background:var(--bg);
   display:flex;align-items:center;gap:8px;
@@ -165,6 +174,28 @@ footer{
 .mic-icon{font-size:18px}
 .mic-label{font-family:monospace;font-size:11px;color:var(--mu)}
 .hint{font-family:monospace;font-size:10px;color:var(--bd);flex:1;text-align:right}
+.typebar{
+  display:flex;align-items:center;gap:8px;flex:1;
+}
+.typeinput{
+  flex:1;background:#0d1420;color:var(--txt);
+  border:1.5px solid var(--bd);border-radius:8px;
+  font-family:system-ui,sans-serif;font-size:13px;
+  padding:7px 11px;outline:none;
+  -webkit-appearance:none;appearance:none;
+  resize:none;
+}
+.typeinput:focus{border-color:var(--cy)}
+.typeinput::placeholder{color:var(--mu)}
+.sendbtn{
+  font-family:monospace;font-size:10px;font-weight:700;
+  padding:7px 13px;border-radius:8px;
+  border:1.5px solid var(--cy);color:var(--cy);
+  background:transparent;cursor:pointer;
+  -webkit-appearance:none;appearance:none;
+  white-space:nowrap;flex-shrink:0;
+}
+.sendbtn:active{background:#001a2a}
 </style>
 </head>
 <body>
@@ -187,9 +218,37 @@ footer{
     ${bubbles}
   </div>
   <footer>
-    <div class="hint" style="flex:1;text-align:right">powered by GeauxAI Labs</div>
+    <form method="POST" action="/prompt" style="margin:0;padding:0;flex:1">
+      <div class="typebar">
+        <textarea class="typeinput" name="text" rows="1" placeholder="Type a prompt → sends to glasses..." maxlength="500"></textarea>
+        <button type="submit" class="sendbtn">⌤ SEND</button>
+      </div>
+    </form>
   </footer>
 </div>
+<script>
+// Pause meta-refresh while textarea has content or focus so the page
+// doesn't reload under the user's fingers while they're typing.
+//
+// idleInterval is baked in by the server:
+//   "4"    -> mic is live OR AI is currently processing (must keep polling)
+//   "3600" -> mic is muted AND AI is idle (freeze for comfortable typing)
+// Pausing always forces 3600. Resuming restores the server-specified rate.
+(function(){
+  var ta=document.querySelector('.typeinput');
+  var mr=document.getElementById('mr');
+  if(!ta||!mr)return;
+  var idleInterval='${refreshSecs}';
+  var pauseInterval='3600';
+  function pause(){mr.setAttribute('content',pauseInterval);}
+  function resume(){if(!ta.value.trim())mr.setAttribute('content',idleInterval);}
+  ta.addEventListener('focus',pause);
+  ta.addEventListener('blur',resume);
+  ta.addEventListener('input',function(){
+    if(ta.value.trim()){pause();}else{resume();}
+  });
+})();
+</script>
 </body>
 </html>`;
 }
@@ -221,6 +280,25 @@ p{font-size:13px;color:#64748b;line-height:1.65}
   Reopen <strong style="color:#e2e8f0">GeauxAiPrompt</strong> from the<br>
   Mentra app to get a fresh link.</p>
 </div>
+<script>
+// Pause meta-refresh while textarea has content or focus
+// Server already sets 3600 when mic is muted — this is a belt-and-suspenders
+// backup for when mic is live and user wants to type.
+(function(){
+  var ta=document.querySelector('.typeinput');
+  var mr=document.getElementById('mr');
+  if(!ta||!mr)return;
+  var liveInterval='4';
+  var pauseInterval='3600';
+  function pause(){mr.setAttribute('content',pauseInterval);}
+  function resume(){if(!ta.value.trim())mr.setAttribute('content',liveInterval);}
+  ta.addEventListener('focus',pause);
+  ta.addEventListener('blur',resume);
+  ta.addEventListener('input',function(){
+    if(ta.value.trim()){pause();}else{resume();}
+  });
+})();
+</script>
 </body>
 </html>`;
 
@@ -231,27 +309,105 @@ class GeauxAIApp extends AppServer {
     console.log(`[Session] Connected: ${userId}`);
     activeSessions.set(userId, session);
 
+    // ── Suppress known harmless SDK noise ─────────────────────────────────────
+    // The G1 glasses send "device_state_update" messages that the current SDK
+    // version doesn't recognize yet. This causes a thrown Error that the SDK's
+    // internal error handler catches and logs as ERROR. We intercept it here so
+    // it doesn't flood the console while the SDK team adds support.
+    // Everything works fine — this is purely cosmetic log suppression.
+    const origEmit = (session as any).emit?.bind(session);
+    if (origEmit) {
+      (session as any).emit = (event: string, ...args: any[]) => {
+        if (event === 'error' && args[0]?.message?.includes('device_state_update')) {
+          // Silently ignore — known unhandled message type from G1 firmware
+          return false;
+        }
+        return origEmit(event, ...args);
+      };
+    }
+
     await session.layouts.showTextWall(
       'GeauxAI Labs\nGeauxAiPrompt Ready\n\nSpeak to send prompts.\nChat log visible on phone.'
     );
 
-    // Button: long-press clears history, single-tap replays last response.
-    // SDK type says pressType is "short" | "long" — we log the raw value so
-    // we can confirm what the G1 actually sends in production if long-press
-    // still doesn't fire (it may be a hardware/app-level issue on the G1).
+    // ── Button handler ────────────────────────────────────────────────────────
+    // G1 has two TouchBars (left temple / right temple).
+    // MentraOS SDK fires onButtonPress with data = { pressType, buttonId, ... }
+    //
+    // buttonId values observed on G1 via MentraOS:
+    //   "right"  — right TouchBar tap
+    //   "left"   — left TouchBar tap
+    //   "main"   — some SDK versions use this for either/both bars
+    //
+    // We log the full raw payload on every press so you can verify exactly what
+    // your hardware sends — check the server console output after pressing each bar.
+    //
+    // Navigation mapping:
+    //   Right short tap  → next page  (forward)
+    //   Left  short tap  → prev page  (back)
+    //   Either long press → clear history (existing behaviour preserved)
+    //
+    // Fallback if buttonId doesn't distinguish sides (older SDK / firmware):
+    //   Short tap → next page (cycles forward through all pages)
+    //   Long press → clear history
     session.events.onButtonPress(async (data: any) => {
-      const pressType: string = data.pressType || '';
-      console.log(`[Button] pressType="${pressType}" raw=${JSON.stringify(data)}`);
+      const pressType: string  = data.pressType  || '';
+      const buttonId:  string  = data.buttonId   || '';
+      // Log everything so you can confirm exact field names your G1 sends
+      console.log(`[Button] pressType="${pressType}" buttonId="${buttonId}" raw=${JSON.stringify(data)}`);
+
       const s = getState(userId);
-      // Accept 'long' (SDK spec) and 'long_press' defensively in case SDK version differs
+
+      // Long press on either side = clear history (unchanged from previous behaviour)
       if (pressType === 'long' || pressType === 'long_press') {
-        s.history = []; s.lastResponse = '';
+        s.history     = [];
+        s.lastResponse = '';
+        s.pages       = [];
+        s.pageIndex   = 0;
         console.log(`[Button] Long press — history cleared for ${userId}`);
         try { await session.layouts.showTextWall('History cleared.\nReady for new prompts.'); } catch {}
-      } else {
-        if (s.lastResponse) {
-          try { await showOnGlasses(session, s.lastResponse); } catch {}
+        return;
+      }
+
+      // Short press — navigate pages if we have a multi-page response
+      if (pressType === 'short' || pressType === '') {
+        if (s.pages.length === 0) {
+          // No paginated response stored yet — replay last response if available
+          if (s.lastResponse) {
+            console.log(`[Button] Short press, no pages — replaying last response`);
+            try { await showOnGlasses(session, s.lastResponse); } catch {}
+          }
+          return;
         }
+
+        // Determine direction: right=forward, left=back, unknown=forward
+        const isRight = buttonId === 'right' || buttonId === 'main';
+        const isLeft  = buttonId === 'left';
+
+        let newIndex = s.pageIndex;
+        if (isLeft) {
+          // Previous page — clamp at 0
+          newIndex = Math.max(0, s.pageIndex - 1);
+        } else {
+          // Next page (right or unknown) — clamp at last page
+          newIndex = Math.min(s.pages.length - 1, s.pageIndex + 1);
+        }
+
+        if (newIndex === s.pageIndex && isLeft  && s.pageIndex === 0) {
+          console.log(`[Button] Already at first page`);
+          try { await session.layouts.showTextWall(`Page 1 of ${s.pages.length}\n(Already at start)\n\n${s.pages[0]}`); } catch {}
+          return;
+        }
+        if (newIndex === s.pageIndex && !isLeft && s.pageIndex === s.pages.length - 1) {
+          console.log(`[Button] Already at last page`);
+          try { await session.layouts.showTextWall(`Page ${s.pages.length} of ${s.pages.length}\n(End of response)\n\n${s.pages[s.pageIndex]}`); } catch {}
+          return;
+        }
+
+        s.pageIndex = newIndex;
+        const suffix = `\n(${s.pageIndex + 1}/${s.pages.length})`;
+        console.log(`[Button] ${isLeft ? 'LEFT←prev' : 'RIGHT→next'} → page ${s.pageIndex + 1}/${s.pages.length}`);
+        try { await session.layouts.showTextWall(s.pages[s.pageIndex] + suffix); } catch {}
       }
     });
 
@@ -275,6 +431,10 @@ class GeauxAIApp extends AppServer {
     const app = this.getExpressApp();
     const owner = OWNER_EMAIL;
 
+    // Required: parse urlencoded form bodies (textarea POST sends text=... urlencoded)
+    // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add it here.
+    app.use(require('express').urlencoded({ extended: false }));
+
     // Serve the live chat page.
     // The SDK auth middleware runs on every request and sets req.authUserId when token is valid.
     // When the meta-refresh signed URL token expires (~3hr), it logs "Signed user token invalid"
@@ -292,11 +452,34 @@ class GeauxAIApp extends AppServer {
         return res.status(401).end(EXPIRED_PAGE_HTML);
       }
       const s = getState(owner);
+      // ── Refresh rate logic ────────────────────────────────────────────────
+      // When mic is muted the page normally polls at 3600s (basically never)
+      // so the user can type without the page reloading under their fingers.
+      //
+      // BUT: when a typed prompt is processing we MUST keep polling fast so
+      // the AI response appears.  We use isProcessing (not pendingRefresh)
+      // as the authority, because pendingRefresh is consumed on the FIRST
+      // GET /webview (which lands before Ollama even starts thinking).
+      // pendingRefresh still gates the initial switch from 3600→4, but we
+      // stay at "4" for the ENTIRE duration of processing.
+      //
+      // State machine:
+      //   mic live  → always "4"
+      //   mic muted, idle         → "3600"  (user can type comfortably)
+      //   mic muted, processing   → "4"     (must show AI response when done)
+      //   mic muted, pending (just submitted, not yet processing) → "4"
+      const activelyProcessing = s.isProcessing || s.pendingRefresh;
+      if (s.pendingRefresh && !s.isProcessing) {
+        // AI finished between the POST /prompt and this GET — clear flag
+        s.pendingRefresh = false;
+      }
+      const refreshSecs = (s.micMuted && !activelyProcessing) ? '3600' : '4';
       const html = buildPage(
         activeSessions.has(owner),
         s.isProcessing,
         s.history,
-        s.micMuted
+        s.micMuted,
+        refreshSecs
       );
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -310,6 +493,8 @@ class GeauxAIApp extends AppServer {
       const s = getState(owner);
       s.history = [];
       s.lastResponse = '';
+      s.pages = [];
+      s.pageIndex = 0;
       console.log('[WebClear] History cleared via New Chat button');
       const session = activeSessions.get(owner);
       if (session) {
@@ -330,11 +515,30 @@ class GeauxAIApp extends AppServer {
       res.redirect(303, '/webview');
     });
 
+    app.post('/prompt', async (req: any, res: any) => {
+      const text = req.body?.text?.trim();
+      if (!text || text.length < 1) return res.redirect(303, '/webview');
+      const session = activeSessions.get(owner);
+      if (!session) {
+        console.log('[TypePrompt] No active glasses session — ignored');
+        return res.redirect(303, '/webview');
+      }
+      const s = getState(owner);
+      if (s.isProcessing) {
+        console.log('[TypePrompt] Already processing — ignored');
+        return res.redirect(303, '/webview');
+      }
+      console.log(`[TypePrompt] "${text.substring(0, 60)}"`);
+      getState(owner).pendingRefresh = true;  // serve one 4s refresh to show AI response
+      handlePrompt(owner, text, session);     // fire-and-forget
+      res.redirect(303, '/webview');
+    });
+
     app.get('/', serve);
     app.get('/webview', serve);
     app.get('/health', (_req: any, res: any) => res.json({ status: 'healthy' }));
 
-    console.log('[Routes] / /webview /health /clear /mic registered — meta-refresh + New Chat + Mic toggle');
+    console.log('[Routes] / /webview /health /clear /mic /prompt registered — meta-refresh + New Chat + Mic toggle + Type prompt');
   }
 }
 
@@ -353,13 +557,24 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     state.history.push({ role: 'assistant', content: clean });
     state.lastResponse = clean;
     if (state.history.length > 40) state.history = state.history.slice(-40);
-    await showOnGlasses(session, clean);
+
+    // ── Release processing lock BEFORE showOnGlasses ─────────────────────
+    // showOnGlasses sleeps PAGE_DELAY (5s) between each glasses page.
+    // Keeping isProcessing=true during those sleeps holds the webview in
+    // "Thinking..." mode and keeps fast-refreshing long after the AI has
+    // actually finished. Release the lock now — the response is already in
+    // state.history so the next 4s webview refresh shows the full response
+    // while showOnGlasses quietly pages through the glasses display in the bg.
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
+
+    await showOnGlasses(session, clean, userId);
   } catch (err: any) {
     console.error(`[Error]`, err.message);
     try { await session.layouts.showTextWall(`Error:\n${truncate(err.message, 80)}`); } catch {}
     if (state.history.length && state.history[state.history.length - 1].role === 'user') state.history.pop();
-  } finally {
-    state.isProcessing = false;
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
   }
 }
 
@@ -391,12 +606,31 @@ async function callAI(history: { role: string; content: string }[]): Promise<str
   return ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
 }
 
-async function showOnGlasses(session: AppSession, text: string) {
+async function showOnGlasses(session: AppSession, text: string, userId?: string) {
   const pages = paginate(text);
-  for (let i = 0; i < pages.length; i++) {
-    const suffix = pages.length > 1 ? `\n(${i + 1}/${pages.length})` : '';
-    try { await session.layouts.showTextWall(pages[i] + suffix); } catch { return; }
-    if (i < pages.length - 1) await sleep(PAGE_DELAY);
+  // If we have a userId, store pages for button navigation
+  if (userId) {
+    const s = getState(userId);
+    s.pages     = pages;
+    s.pageIndex = 0;
+  }
+  // Always show page 1 immediately
+  const suffix = pages.length > 1 ? `\n(1/${pages.length})` : '';
+  try { await session.layouts.showTextWall(pages[0] + suffix); } catch {}
+  // Auto-advance remaining pages with PAGE_DELAY so user still gets
+  // the auto-scroll experience for short multi-page responses,
+  // but they can also press buttons to jump manually at any time.
+  for (let i = 1; i < pages.length; i++) {
+    await sleep(PAGE_DELAY);
+    // Only auto-advance if user hasn't manually navigated away from expected position
+    if (userId) {
+      const s = getState(userId);
+      // If user pressed a button and moved off this page, stop auto-advancing
+      if (s.pageIndex !== i - 1) break;
+      s.pageIndex = i;
+    }
+    const sfx = `\n(${i + 1}/${pages.length})`;
+    try { await session.layouts.showTextWall(pages[i] + sfx); } catch { return; }
   }
 }
 
