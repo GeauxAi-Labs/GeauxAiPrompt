@@ -5,14 +5,37 @@ const PORT         = parseInt(process.env.PORT || '3000');
 const PACKAGE_NAME = process.env.PACKAGE_NAME || 'com.geauxailabs.geauxaiprompt';
 const API_KEY      = process.env.MENTRA_API_KEY || '';
 const AI_PROVIDER  = process.env.AI_PROVIDER   || 'ollama';
-const AI_MODEL     = process.env.AI_MODEL      || 'llama3.2:3b';
+const AI_MODEL     = process.env.AI_MODEL      || 'deepseek-v3.1:671b-cloud';
+const WAKE_WORD    = (process.env.WAKE_WORD    || 'Go AI').toLowerCase();
 const OPENAI_KEY   = process.env.OPENAI_API_KEY   || '';
 const ANTHROPIC_KEY= process.env.ANTHROPIC_API_KEY|| '';
 const OLLAMA_HOST  = process.env.OLLAMA_HOST   || 'http://localhost:11434';
-const PAGE_DELAY   = parseInt(process.env.PAGE_DELAY_MS || '5000');
+const PAGE_DELAY         = parseInt(process.env.PAGE_DELAY_MS        || '5000');
+const AUTO_CLEAR_DELAY_MS  = parseInt(process.env.AUTO_CLEAR_DELAY_MS  || '60000');
+const STATUS_CLEAR_DELAY_MS = parseInt(process.env.STATUS_CLEAR_DELAY_MS || '5000');
 const OWNER_EMAIL  = process.env.OWNER_EMAIL || '';
+const WEB_SEARCH_ENABLED = process.env.WEB_SEARCH_ENABLED !== 'false';
+const TAVILY_API_KEY     = process.env.TAVILY_API_KEY     || '';
+const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY  || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'ZzBpNW0j7Iq2XRx6Xo49';
+const KOKORO_HOST   = process.env.KOKORO_HOST   || 'http://localhost:8880';
+const KOKORO_VOICE  = process.env.KOKORO_VOICE  || 'am_eric';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://app.geauxailabs.com';
+const MAX_HISTORY_PAIRS  = 6;   // keep last 6 user+assistant pairs (12 messages)
+const MAX_RESPONSE_CHARS = 1200; // cap runaway model output before display
+const RATE_LIMIT_WINDOW_MS   = 60000;  // 60-second rolling window
+const RATE_LIMIT_MAX_REQUESTS = 10;    // max prompts per window
 
 // ── State ─────────────────────────────────────────────────────────────────────
+interface GenParams {
+  systemPrompt: string;
+  temperature:  number;
+  topP:         number;
+  maxTokens:    number;
+  model:        string;  // empty string = use AI_MODEL from .env (server default)
+  webSearch:    boolean;
+}
+
 interface UserState {
   history:        { role: string; content: string }[];
   lastResponse:   string;
@@ -22,55 +45,138 @@ interface UserState {
   // Pagination state — stored so buttons can navigate without re-running AI
   pages:          string[];  // paginated chunks of lastResponse
   pageIndex:      number;    // currently displayed page (0-based)
+  autoClearTimer:  ReturnType<typeof setTimeout> | null;  // per-user AI response auto-clear
+  statusClearTimer: ReturnType<typeof setTimeout> | null;  // per-user status message auto-clear
+  genParams:      GenParams;  // per-user AI generation parameters
+  sseClients:     any[];      // SSE response objects waiting for push events
+  deviceState:    { batteryLevel: number | null; charging: boolean; wifiConnected: boolean; } | null;
+  isListening:    boolean;
+  ttsEnabled:     boolean;
+  ttsEngine:      'elevenlabs' | 'kokoro';
 }
-const userStates     = new Map<string, UserState>();
-const activeSessions = new Map<string, AppSession>();
+const userStates          = new Map<string, UserState>();
+const activeSessions      = new Map<string, AppSession>();
+const devicePollIntervals = new Map<string, ReturnType<typeof setInterval>>();
+const rateLimits          = new Map<string, { count: number; resetTime: number }>();
+const audioCache          = new Map<string, { buf: Buffer; expires: number }>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of audioCache) {
+    if (now > entry.expires) audioCache.delete(id);
+  }
+}, 300_000);
+
+const DEFAULT_GEN_PARAMS: GenParams = {
+  systemPrompt: '',
+  temperature:  0.7,
+  topP:         0.95,
+  maxTokens:    2048,
+  model:        '',
+  webSearch:    true,
+};
 
 function getState(userId: string): UserState {
   if (!userStates.has(userId)) {
     userStates.set(userId, {
       history: [], lastResponse: '', isProcessing: false,
       micMuted: false, pendingRefresh: false,
-      pages: [], pageIndex: 0
+      pages: [], pageIndex: 0, autoClearTimer: null, statusClearTimer: null,
+      genParams: { ...DEFAULT_GEN_PARAMS }, sseClients: [], deviceState: null,
+      isListening: false, ttsEnabled: false, ttsEngine: 'kokoro',
     });
   }
   return userStates.get(userId)!;
+}
+
+function cancelAutoClearTimer(userId: string) {
+  const s = getState(userId);
+  if (s.autoClearTimer !== null) {
+    clearTimeout(s.autoClearTimer);
+    s.autoClearTimer = null;
+    console.log(`[AutoClear] Timer cancelled for ${userId}`);
+  }
+}
+
+function cancelStatusClearTimer(userId: string) {
+  const s = getState(userId);
+  if (s.statusClearTimer !== null) {
+    clearTimeout(s.statusClearTimer);
+    s.statusClearTimer = null;
+    console.log(`[StatusClear] Timer cancelled for ${userId}`);
+  }
+}
+
+function broadcastToUser(userId: string, event: string, data: object) {
+  const s = userStates.get(userId);
+  if (!s || s.sseClients.length === 0) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  s.sseClients = s.sseClients.filter(res => {
+    try { res.write(payload); return true; } catch { return false; }
+  });
+}
+
+async function showStatusOnGlasses(session: AppSession, userId: string, msg: string) {
+  cancelStatusClearTimer(userId);
+  try { await session.layouts.showDoubleTextWall('GeauxAI', msg); } catch {}
+  const s = getState(userId);
+  s.statusClearTimer = setTimeout(async () => {
+    s.statusClearTimer = null;
+    const activeSession = activeSessions.get(userId);
+    if (activeSession) {
+      try { await activeSession.layouts.clearView(); } catch {}
+      console.log(`[StatusClear] Display cleared for ${userId}`);
+    }
+  }, STATUS_CLEAR_DELAY_MS);
+  console.log(`[StatusClear] Timer started for ${userId} (${STATUS_CLEAR_DELAY_MS}ms)`);
 }
 
 function esc(t: string): string {
   return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
 }
 
-// Build the full HTML page with conversation baked in — no JS required at all.
-// The page auto-refreshes every 4 seconds via <meta http-equiv="refresh">.
-// This works in ANY WebView, any browser, zero JavaScript needed.
-function buildPage(connected: boolean, processing: boolean, history: {role:string;content:string}[], micMuted: boolean, refreshSecs = '4'): string {
-  const statusText = processing ? '⏳ Thinking...' : connected ? '🟢 Connected — speak into your glasses' : '⚪ Waiting for glasses connection...';
-  const pillClass  = processing ? 'thinking' : connected ? 'connected' : 'waiting';
-  const pillLabel  = processing ? '● THINKING' : connected ? '● CONNECTED' : '● WAITING';
+// ── Web UI ────────────────────────────────────────────────────────────────────
+function buildPage(
+  connected: boolean,
+  processing: boolean,
+  history: { role: string; content: string }[],
+  micMuted: boolean,
+  ttsEnabled: boolean,
+  ttsEngine: 'elevenlabs' | 'kokoro',
+  promptCount: number = 0
+): string {
+  const modelDisplay = AI_MODEL.split(':')[0];
+  const ttsChipLabel = ttsEnabled ? '🔊 VOICE ON' : '🔇 VOICE OFF';
+  const engineChipLabel = ttsEngine === 'kokoro' ? '⚡ KOKORO' : '☁ ELEVEN';
+  const statusChipClass = processing ? 'chip-thinking' : connected ? 'chip-live' : 'chip-offline';
+  const statusChipLabel = processing ? '● THINKING' : connected ? '● LIVE' : '● OFFLINE';
+  const statusText = processing
+    ? '⏳ Generating response...'
+    : connected
+      ? `🟢 Say &quot;${esc(WAKE_WORD)}&quot; then speak`
+      : '⚪ Waiting for glasses connection...';
+  const dotClass = processing ? 'busy' : connected ? 'ok' : '';
 
   let bubbles = '';
   if (history.length === 0) {
-    bubbles = `
-      <div class="empty">
-        <div class="icon">🎤</div>
-        <div class="t">Voice Chat Log</div>
-        <div class="sub">Speak into your G1 glasses.<br>Your conversation will appear here live.</div>
-      </div>`;
+    bubbles = `<div class="empty">
+      <div class="empty-orb">
+        <svg viewBox="0 0 56 56" fill="none"><circle cx="28" cy="28" r="24" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4" opacity=".4"/><circle cx="28" cy="28" r="14" stroke="currentColor" stroke-width="1" opacity=".25"/><circle cx="28" cy="28" r="4" fill="currentColor" opacity=".6"/></svg>
+      </div>
+      <div class="empty-title">GeauxAI is ready</div>
+      <div class="empty-sub">Say <kbd>${esc(WAKE_WORD)}</kbd> then ask anything.<br>Your conversation streams here live.</div>
+    </div>`;
   } else {
     for (const msg of history) {
-      const isUser = msg.role === 'user';
-      bubbles += `
-      <div class="msg">
-        <div class="lbl ${isUser ? 'you' : 'ai'}">${isUser ? 'YOU' : 'AI'}</div>
-        <div class="bbl ${isUser ? 'you' : 'ai'}">${esc(msg.content)}</div>
+      const u = msg.role === 'user';
+      bubbles += `<div class="msg ${u ? 'msg-u' : 'msg-a'}">
+        <div class="msg-role">${u ? 'YOU' : 'AI'}</div>
+        <div class="msg-body">${esc(msg.content)}</div>
       </div>`;
     }
     if (processing) {
-      bubbles += `
-      <div class="msg" id="thinking">
-        <div class="lbl ai">AI</div>
-        <div class="bbl ai"><span class="dots">●&nbsp;●&nbsp;●</span></div>
+      bubbles += `<div class="msg msg-a" id="thinking">
+        <div class="msg-role">AI</div>
+        <div class="msg-body dots"><span></span><span></span><span></span></div>
       </div>`;
     }
   }
@@ -79,174 +185,605 @@ function buildPage(connected: boolean, processing: boolean, history: {role:strin
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta id="mr" http-equiv="refresh" content="${refreshSecs}">
-<title>GeauxAiPrompt</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>GeauxAI · G1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#080c10;--card:#0d1420;--cy:#06b6d4;--txt:#e2e8f0;
-  --mu:#64748b;--bd:#1e293b;--gr:#10b981;--am:#f59e0b;--rd:#ef4444;
+  --bg:#09071a;--bg2:#110e24;--bg3:#1a1630;
+  --glass:#ffffff07;--glass2:#ffffff10;
+  --edge:#ffffff14;--edge2:#ffffff22;
+  --v:#7c3aed;--v2:#a855f7;--v3:#c4b5fd;
+  --c:#06b6d4;--c2:#67e8f9;
+  --g:#10b981;--g2:#34d399;
+  --a:#f59e0b;--r:#ef4444;
+  --tx:#f1f5f9;--tx2:#94a3b8;--tx3:#475569;
+  --mono:'JetBrains Mono',monospace;
+  --ui:'Syne',sans-serif;
+  --rad:12px;
 }
-html,body{background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif;min-height:100%}
-.app{display:flex;flex-direction:column;min-height:100dvh;max-width:520px;margin:0 auto}
+html{height:100%;-webkit-text-size-adjust:100%}
+body{
+  min-height:100%;background:var(--bg);color:var(--tx);font-family:var(--ui);
+  background-image:
+    radial-gradient(ellipse 70% 40% at 50% 0%,#2d0f5c1a 0%,transparent 65%),
+    radial-gradient(ellipse 40% 25% at 85% 75%,#0a3d4a14 0%,transparent 55%);
+  background-attachment:fixed;
+}
+.shell{display:flex;flex-direction:column;min-height:100dvh;max-width:540px;margin:0 auto}
 
-header{
-  position:sticky;top:0;z-index:10;
-  padding:10px 16px 8px;
-  border-bottom:1px solid var(--bd);
-  display:flex;align-items:center;gap:10px;
-  background:var(--bg);
-  flex-shrink:0;
-}
-.logo{font-family:monospace;font-size:11px;font-weight:700;color:var(--cy);flex:1;letter-spacing:.05em}
-.pill{
-  font-family:monospace;font-size:10px;font-weight:700;
-  padding:4px 9px;border-radius:99px;border:1.5px solid;
-}
-.pill.waiting{border-color:var(--mu);color:var(--mu)}
-.pill.connected{border-color:var(--gr);color:var(--gr);background:#0a1a0a}
-.pill.thinking{border-color:var(--am);color:var(--am);background:#1a1200}
-.newchat{
-  font-family:monospace;font-size:10px;font-weight:700;
-  padding:4px 9px;border-radius:99px;
-  border:1.5px solid var(--rd);color:var(--rd);
-  background:transparent;cursor:pointer;
-  -webkit-appearance:none;appearance:none;
-}
-.newchat:active{background:#1a0505}
-.mic-btn{
-  font-family:monospace;font-size:11px;font-weight:700;
-  padding:5px 11px;border-radius:99px;
-  border:1.5px solid;cursor:pointer;
-  -webkit-appearance:none;appearance:none;
-  background:transparent;
-}
-.mic-btn.live{border-color:var(--gr);color:var(--gr)}
-.mic-btn.live:active{background:#0a1a0a}
-.mic-btn.muted{border-color:var(--rd);color:var(--rd)}
-.mic-btn.muted:active{background:#1a0505}
-
-.statusbar{
-  display:flex;align-items:center;gap:8px;padding:5px 16px;
-  background:var(--card);border-bottom:1px solid var(--bd);
-  flex-shrink:0;
-}
-.dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--mu)}
-.dot.ok{background:var(--gr)}
-.dot.busy{background:var(--am)}
-.stxt{font-size:10px;color:var(--mu);font-family:monospace}
-
-.feed{
-  flex:1;padding:12px 16px 110px;
-  display:flex;flex-direction:column;gap:10px;
-}
-.empty{
-  flex:1;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;
-  gap:8px;color:var(--mu);text-align:center;padding:32px;margin-top:60px;
-}
-.empty .icon{font-size:32px;margin-bottom:4px}
-.empty .t{font-size:15px;font-weight:600;color:var(--txt)}
-.empty .sub{font-size:12px;line-height:1.6}
-.msg{animation:fi .25s ease-out}
-@keyframes fi{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-.lbl{font-size:9px;letter-spacing:.12em;text-transform:uppercase;font-family:monospace;margin-bottom:3px}
-.lbl.you{color:var(--cy)}.lbl.ai{color:var(--gr)}
-.bbl{
-  padding:10px 13px;border-radius:10px;
-  font-size:14px;line-height:1.55;word-break:break-word;
-}
-.bbl.you{background:#0e2a42;border:1px solid #1a4a6e;max-width:92%}
-.bbl.ai{background:var(--card);border:1px solid var(--bd);max-width:92%}
-.dots{letter-spacing:4px;color:var(--am);animation:pulse 1.2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-
-footer{
-  position:fixed;bottom:0;left:0;right:0;
-  max-width:520px;margin:0 auto;
-  padding:8px 16px env(safe-area-inset-bottom, 20px);
-  padding-bottom:max(20px, env(safe-area-inset-bottom, 20px));
-  border-top:1px solid var(--bd);
-  background:var(--bg);
+/* Header */
+.hd{
+  position:sticky;top:0;z-index:20;
+  padding:10px 14px 8px;
+  background:linear-gradient(180deg,var(--bg) 75%,transparent);
   display:flex;align-items:center;gap:8px;
 }
-.mic-icon{font-size:18px}
-.mic-label{font-family:monospace;font-size:11px;color:var(--mu)}
-.hint{font-family:monospace;font-size:10px;color:var(--bd);flex:1;text-align:right}
-.typebar{
-  display:flex;align-items:center;gap:8px;flex:1;
+.hd-brand{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.logo-img{width:32px;height:32px;flex-shrink:0;border-radius:9px;object-fit:contain;}
+.hd-text{min-width:0}
+.hd-name{
+  font-family:var(--mono);font-size:10px;font-weight:700;
+  color:var(--v3);letter-spacing:.07em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
-.typeinput{
-  flex:1;background:#0d1420;color:var(--txt);
-  border:1.5px solid var(--bd);border-radius:8px;
-  font-family:system-ui,sans-serif;font-size:13px;
-  padding:7px 11px;outline:none;
-  -webkit-appearance:none;appearance:none;
-  resize:none;
+.hd-sub{font-family:var(--mono);font-size:8px;color:var(--tx3);letter-spacing:.04em}
+.hd-right{display:flex;gap:5px;align-items:center;flex-shrink:0}
+
+/* Chips */
+.chip{
+  display:inline-flex;align-items:center;gap:3px;
+  font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.07em;
+  padding:4px 8px;border-radius:99px;border:1px solid;
+  cursor:pointer;background:transparent;-webkit-appearance:none;
+  transition:background .15s,transform .1s;white-space:nowrap;
 }
-.typeinput:focus{border-color:var(--cy)}
-.typeinput::placeholder{color:var(--mu)}
-.sendbtn{
-  font-family:monospace;font-size:10px;font-weight:700;
-  padding:7px 13px;border-radius:8px;
-  border:1.5px solid var(--cy);color:var(--cy);
-  background:transparent;cursor:pointer;
-  -webkit-appearance:none;appearance:none;
-  white-space:nowrap;flex-shrink:0;
+.chip:active{transform:scale(.94)}
+.chip-status{pointer-events:none;border-color:var(--edge);color:var(--tx3)}
+.chip-live{border-color:#10b98140;color:var(--g);background:#10b9810a}
+.chip-thinking{border-color:#f59e0b40;color:var(--a);background:#f59e0b0a;animation:blink 1.6s infinite}
+.chip-offline{border-color:var(--edge);color:var(--tx3)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.6}}
+.chip-mic{border-color:var(--g2);color:var(--g2)}
+.chip-mic.muted{border-color:var(--r);color:var(--r)}
+.chip-mic:active{background:var(--glass)}
+.chip-tts{border-color:var(--c);color:var(--c)}
+.chip-tts.off{border-color:var(--edge);color:var(--tx3)}
+.chip-engine{border-color:var(--v2);color:var(--v3)}
+.chip-x{border-color:var(--edge);color:var(--tx3)}
+.chip-x:active{background:var(--glass);border-color:#ef444460;color:var(--r)}
+#dev-info{font-family:var(--mono);font-size:9px;color:var(--tx3);flex-shrink:0}
+
+/* Status bar */
+.sbar{
+  display:flex;align-items:center;gap:8px;padding:5px 14px;
+  background:var(--glass);border-bottom:1px solid var(--edge);flex-shrink:0;
+  font-family:var(--mono);font-size:10px;color:var(--tx3);
 }
-.sendbtn:active{background:#001a2a}
+.sdot{width:5px;height:5px;border-radius:50%;background:var(--tx3);flex-shrink:0}
+.sdot.ok{background:var(--g);box-shadow:0 0 6px var(--g)}
+.sdot.busy{background:var(--a);box-shadow:0 0 6px var(--a)}
+.stxt{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scount{font-size:8px;color:var(--tx3);flex-shrink:0}
+
+/* Listening bar */
+.lbar{
+  display:none;padding:8px 14px;
+  background:linear-gradient(90deg,transparent,#1c1034 15%,#1c1034 85%,transparent);
+  border-bottom:1px solid #7c3aed28;
+  font-family:var(--mono);font-size:11px;color:var(--v3);
+  align-items:flex-start;gap:8px;
+  max-height:140px;overflow-y:auto;
+}
+.lwave{display:flex;gap:2px;align-items:center;flex-shrink:0}
+.lwave span{
+  display:block;width:2px;background:var(--v2);border-radius:1px;
+  animation:wave .8s ease-in-out infinite;
+}
+.lwave span:nth-child(1){height:5px;animation-delay:0s}
+.lwave span:nth-child(2){height:11px;animation-delay:.1s}
+.lwave span:nth-child(3){height:7px;animation-delay:.2s}
+.lwave span:nth-child(4){height:13px;animation-delay:.15s}
+.lwave span:nth-child(5){height:5px;animation-delay:.05s}
+@keyframes wave{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.35)}}
+.ltxt{flex:1;white-space:pre-wrap;word-break:break-word;line-height:1.55;}
+
+/* Params */
+.params-wrap{border-bottom:1px solid var(--edge);flex-shrink:0}
+.params-btn{
+  width:100%;padding:7px 14px;display:flex;align-items:center;justify-content:space-between;
+  background:transparent;border:none;cursor:pointer;
+  font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--tx3);transition:color .15s;
+}
+.params-btn:hover{color:var(--v3)}
+.params-chev{transition:transform .2s}
+.params-body{padding:10px 14px 14px;background:var(--glass);display:flex;flex-direction:column;gap:11px}
+.p-row{display:flex;flex-direction:column;gap:4px}
+.p-lbl{font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3)}
+.p-hint{font-size:8px;font-weight:400;letter-spacing:.02em;text-transform:none;color:var(--tx3);opacity:.6}
+.p-lbl-row{display:flex;justify-content:space-between;align-items:center}
+.p-val{font-family:var(--mono);font-size:9px;color:var(--v3);background:var(--bg3);padding:1px 6px;border-radius:4px;border:1px solid var(--edge)}
+.p-sys{
+  width:100%;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge);border-radius:var(--rad);
+  font-family:var(--mono);font-size:11px;line-height:1.55;
+  padding:7px 10px;outline:none;resize:vertical;min-height:52px;
+}
+.p-sys:focus{border-color:var(--v2)}.p-sys::placeholder{color:var(--tx3)}
+.p-slider{
+  width:100%;-webkit-appearance:none;height:3px;border-radius:2px;
+  background:var(--edge);outline:none;cursor:pointer;
+}
+.p-slider::-webkit-slider-thumb{
+  -webkit-appearance:none;width:13px;height:13px;border-radius:50%;
+  background:var(--v2);border:2px solid var(--bg);box-shadow:0 0 5px var(--v);
+}
+.p-num{
+  width:100%;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge);border-radius:var(--rad);
+  font-family:var(--mono);font-size:12px;padding:5px 10px;outline:none;
+}
+.p-num:focus{border-color:var(--v2)}
+.p-sel{
+  width:100%;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge);border-radius:var(--rad);
+  font-family:var(--mono);font-size:11px;padding:5px 10px;outline:none;cursor:pointer;
+}
+.p-sel:focus{border-color:var(--v2)}
+.p-tog-row{display:flex;align-items:center;gap:10px}
+.tsw{position:relative;width:36px;height:20px;flex-shrink:0}
+.tsw input{opacity:0;width:0;height:0}
+.ttrack{
+  position:absolute;top:0;left:0;right:0;bottom:0;
+  background:var(--edge);border-radius:10px;cursor:pointer;transition:background .2s;
+}
+.ttrack::before{
+  content:'';position:absolute;width:14px;height:14px;border-radius:50%;
+  left:3px;bottom:3px;background:var(--tx3);transition:.2s;
+}
+.tsw input:checked + .ttrack{background:var(--v)}
+.tsw input:checked + .ttrack::before{transform:translateX(16px);background:#fff}
+.thint{font-family:var(--mono);font-size:8.5px;color:var(--tx3)}
+
+/* Feed */
+.feed{flex:1;padding:12px 14px 120px;display:flex;flex-direction:column;gap:11px;overflow-y:auto}
+
+/* Empty */
+.empty{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:12px;color:var(--tx3);text-align:center;padding:40px 20px;margin-top:10px;
+}
+.empty-orb{width:60px;height:60px;color:var(--v);animation:float 3.5s ease-in-out infinite}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+.empty-title{font-size:15px;font-weight:700;color:var(--tx2)}
+.empty-sub{font-size:12px;line-height:1.75;color:var(--tx3)}
+kbd{
+  display:inline;background:var(--bg3);border:1px solid var(--edge2);
+  border-radius:4px;padding:0 5px;font-family:var(--mono);font-size:11px;color:var(--v3);
+}
+
+/* Messages */
+.msg{display:flex;flex-direction:column;gap:3px;animation:fin .22s cubic-bezier(.16,1,.3,1)}
+@keyframes fin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.msg-role{
+  font-family:var(--mono);font-size:8px;font-weight:700;
+  letter-spacing:.14em;text-transform:uppercase;padding:0 2px;
+}
+.msg-u .msg-role{color:var(--v3)}.msg-a .msg-role{color:var(--c2)}
+.msg-body{
+  padding:9px 12px;border-radius:10px;
+  font-size:13.5px;line-height:1.6;word-break:break-word;
+}
+.msg-u .msg-body{
+  background:linear-gradient(135deg,#2a1a4a,#1a0e38);
+  border:1px solid #7c3aed28;border-bottom-right-radius:3px;
+  max-width:90%;align-self:flex-end;
+}
+.msg-a .msg-body{
+  background:var(--glass);border:1px solid var(--edge);
+  border-bottom-left-radius:3px;max-width:94%;
+}
+
+/* Thinking dots */
+.dots{display:flex;gap:5px;align-items:center;padding:11px 12px}
+.dots span{
+  width:6px;height:6px;border-radius:50%;background:var(--c2);opacity:.25;
+  animation:dp 1.4s ease-in-out infinite;
+}
+.dots span:nth-child(1){animation-delay:0s}.dots span:nth-child(2){animation-delay:.2s}.dots span:nth-child(3){animation-delay:.4s}
+@keyframes dp{0%,80%,100%{opacity:.25;transform:scale(.75)}40%{opacity:1;transform:scale(1)}}
+
+/* Footer */
+.ft{
+  position:fixed;bottom:0;left:0;right:0;max-width:540px;margin:0 auto;
+  padding:10px 14px;padding-bottom:max(14px,env(safe-area-inset-bottom,14px));
+  background:linear-gradient(0deg,var(--bg) 65%,transparent);
+  display:flex;gap:8px;align-items:flex-end;
+}
+.ft-inp{
+  flex:1;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge2);border-radius:10px;
+  font-family:var(--ui);font-size:13px;line-height:1.4;
+  padding:9px 12px;outline:none;resize:none;
+  min-height:38px;max-height:100px;
+  transition:border-color .15s;-webkit-appearance:none;
+}
+.ft-inp:focus{border-color:var(--v2);background:#18122e}
+.ft-inp::placeholder{color:var(--tx3)}
+.ft-go{
+  flex-shrink:0;width:38px;height:38px;
+  background:linear-gradient(135deg,var(--v),var(--v2));
+  border:none;border-radius:10px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  font-size:17px;font-weight:700;color:#fff;
+  box-shadow:0 0 14px #7c3aed44;
+  transition:opacity .15s,transform .1s;
+}
+.ft-go:active{transform:scale(.9);opacity:.8}
+.ft-go:disabled{opacity:.28;cursor:not-allowed}
 </style>
+
+<script>
+(function(){
+  var sp=new URLSearchParams(window.location.search);
+  var tok=sp.get('token')||sp.get('t')||'';
+  var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
+  var sseTimer=null;
+
+  function applyState(d){
+    var dot=document.querySelector('.sdot');
+    var stxt=document.getElementById('stxt');
+    var chip=document.getElementById('chip-status');
+    var mic=document.getElementById('sse-mic');
+    if(dot) dot.className='sdot'+(d.processing?' busy':d.connected?' ok':'');
+    if(stxt) stxt.textContent=d.processing?(d.searching?'🔍 Searching the web...':'⏳ Generating response...'):(d.connected?'🟢 Say "${WAKE_WORD}" then speak':'⚪ Waiting for glasses...');
+    if(chip){
+      chip.className='chip chip-status '+(d.processing?'chip-thinking':d.connected?'chip-live':'chip-offline');
+      chip.textContent=d.processing?'● THINKING':d.connected?'● LIVE':'● OFFLINE';
+    }
+    if(mic&&d.micMuted!==undefined){
+      mic.className='chip chip-mic'+(d.micMuted?' muted':'');
+      mic.textContent=d.micMuted?'🔇 MUTED':'🎤 MIC ON';
+    }
+    if(d.ttsEnabled!==undefined){
+      var tc=document.getElementById('chip-tts');
+      if(tc){tc.textContent=d.ttsEnabled?'🔊 VOICE ON':'🔇 VOICE OFF';
+        if(d.ttsEnabled){tc.classList.remove('off');}else{tc.classList.add('off');}}
+    }
+    if(d.ttsEngine!==undefined){
+      var ec=document.getElementById('chip-engine');
+      if(ec) ec.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
+    }
+    if(d.reload){
+      var inp=document.getElementById('ft-inp');
+      if(inp && inp.value.trim().length>0){
+        // User is typing — reload after they clear/submit instead of wiping their text
+        inp.dataset.pendingReload='1';
+      } else {
+        window.location.reload();
+      }
+    }
+  }
+
+  function applyDevice(d){
+    var el=document.getElementById('dev-info');
+    if(!el) return;
+    var bat=d.batteryLevel;
+    var pct=(bat!==null&&bat!==undefined)?bat+'%':'?';
+    var icon=bat<=10?'🪫':'🔋';
+    el.textContent=icon+' '+pct+(d.charging?'⚡':'')+(d.wifiConnected?' 📶':'');
+  }
+
+  function applyListening(d){
+    var bar=document.getElementById('lbar');
+    var txt=document.getElementById('ltxt');
+    if(!bar) return;
+    if(d.active){
+      bar.style.display='flex';
+      if(txt){
+        txt.textContent=d.partial?d.partial:'Listening…';
+        bar.scrollTop=bar.scrollHeight;
+      }
+    } else {
+      bar.style.display='none';
+      if(txt) txt.textContent='';
+    }
+  }
+
+  function safeReload(){
+    var inp=document.getElementById('ft-inp');
+    if(inp && inp.value.trim().length>0){
+      inp.dataset.pendingReload='1';
+    } else {
+      window.location.reload();
+    }
+  }
+
+  function connectSSE(){
+    var es=new EventSource('/api/stream'+authQ);
+    clearTimeout(sseTimer);
+    sseTimer=setTimeout(safeReload,120000);
+    es.addEventListener('state',function(e){
+      clearTimeout(sseTimer);
+      sseTimer=setTimeout(safeReload,120000);
+      try{applyState(JSON.parse(e.data));}catch(ex){}
+    });
+    es.addEventListener('keepalive',function(){
+      clearTimeout(sseTimer);
+      sseTimer=setTimeout(safeReload,120000);
+    });
+    es.addEventListener('device',function(e){try{applyDevice(JSON.parse(e.data));}catch(ex){}});
+    es.addEventListener('listening',function(e){try{applyListening(JSON.parse(e.data));}catch(ex){}});
+    es.addEventListener('tts_audio', function(e) {
+      try {
+        var d = JSON.parse(e.data);
+        var player = document.getElementById('_kplayer');
+        if (!player) {
+          player = document.createElement('audio');
+          player.id = '_kplayer';
+          player.controls = false;
+          player.autoplay = true;
+          document.body.appendChild(player);
+        }
+        // Force reload by clearing src first
+        player.pause();
+        player.removeAttribute('src');
+        player.load();
+        player.src = d.url + '?t=' + Date.now();
+        player.load();
+        var p = player.play();
+        if (p !== undefined) {
+          p.catch(function(err) {
+            // Autoplay blocked — show a visible play button as fallback
+            var btn = document.getElementById('_kplay_btn');
+            if (!btn) {
+              btn = document.createElement('button');
+              btn.id = '_kplay_btn';
+              btn.style.cssText = 'position:fixed;bottom:80px;right:20px;z-index:9999;padding:12px 20px;background:#a855f7;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;';
+              btn.textContent = '▶ Play Audio';
+              document.body.appendChild(btn);
+            }
+            btn.style.display = 'block';
+            btn.onclick = function() {
+              player.play();
+              btn.style.display = 'none';
+            };
+          });
+        }
+      } catch(ex) {}
+    });
+    es.onerror=function(){es.close();setTimeout(connectSSE,3000);};
+  }
+  connectSSE();
+})();
+</script>
 </head>
 <body>
-<div class="app">
-  <header>
-    <div class="logo">⬡ GEAUXAILABS / GEAUXAIPROMPT</div>
-    <div class="pill ${pillClass}">${pillLabel}</div>
-    <form method="POST" action="/mic" style="margin:0;padding:0">
-      <button type="submit" class="mic-btn ${micMuted ? 'muted' : 'live'}">${micMuted ? '🔇 MIC OFF' : '🎤 MIC ON'}</button>
-    </form>
-    <form method="POST" action="/clear" style="margin:0;padding:0">
-      <button type="submit" class="newchat">✕ NEW CHAT</button>
-    </form>
-  </header>
-  <div class="statusbar">
-    <div class="dot ${processing ? 'busy' : connected ? 'ok' : ''}"></div>
-    <div class="stxt">${esc(statusText)}</div>
+<div class="shell">
+
+<header class="hd">
+  <div class="hd-brand">
+    <img src="/logo.png" class="logo-img" alt="GeauxAI Labs">
+    <div class="hd-text">
+      <div class="hd-name">GEAUXAI LABS / GEAUXAIPROMPT</div>
+      <div class="hd-sub">${modelDisplay} · ${AI_PROVIDER.toUpperCase()}</div>
+    </div>
   </div>
-  <div class="feed">
-    ${bubbles}
-  </div>
-  <footer>
-    <form method="POST" action="/prompt" style="margin:0;padding:0;flex:1">
-      <div class="typebar">
-        <textarea class="typeinput" name="text" rows="1" placeholder="Type a prompt → sends to glasses..." maxlength="500"></textarea>
-        <button type="submit" class="sendbtn">⌤ SEND</button>
-      </div>
+  <div class="hd-right">
+    <div id="dev-info">⚠️</div>
+    <div id="chip-status" class="chip chip-status ${statusChipClass}">${statusChipLabel}</div>
+    <button class="chip chip-tts${ttsEnabled ? '' : ' off'}" id="chip-tts" onclick="toggleTTS()">${ttsChipLabel}</button>
+    <button class="chip chip-engine" id="chip-engine" onclick="toggleTTSEngine()">${engineChipLabel}</button>
+    <form method="POST" action="/mic" style="margin:0">
+      <button type="submit" id="sse-mic" class="chip chip-mic${micMuted ? ' muted' : ''}">${micMuted ? '🔇 MUTED' : '🎤 MIC ON'}</button>
     </form>
-  </footer>
+    <form method="POST" action="/clear" style="margin:0">
+      <button type="submit" class="chip chip-x">✕ CLEAR</button>
+    </form>
+  </div>
+</header>
+
+<div class="sbar">
+  <div class="sdot ${dotClass}"></div>
+  <div class="stxt" id="stxt">${statusText}</div>
+  ${promptCount > 0 ? `<span class="scount">${promptCount} prompt${promptCount !== 1 ? 's' : ''}</span>` : ''}
 </div>
+
+<div id="lbar" class="lbar">
+  <div class="lwave"><span></span><span></span><span></span><span></span><span></span></div>
+  <div id="ltxt" class="ltxt">Listening…</div>
+</div>
+
+<div class="params-wrap">
+  <button class="params-btn" type="button" onclick="toggleP()" id="params-btn">
+    <span>⚙ SYSTEM PROMPT &amp; PARAMETERS</span>
+    <span class="params-chev" id="params-chev">▼</span>
+  </button>
+  <div class="params-body" id="params-body" style="display:none">
+    <div class="p-row">
+      <span class="p-lbl">MODEL <span class="p-hint">— override default AI model for this session</span></span>
+      <select class="p-sel" id="p-model"><option value="">Default (${AI_MODEL})</option></select>
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">WEB SEARCH <span class="p-hint">— inject live results for current events &amp; facts</span></span>
+      <div class="p-tog-row">
+        <label class="tsw"><input type="checkbox" id="p-ws"><span class="ttrack"></span></label>
+        <span class="thint" id="p-ws-hint">OFF — model knowledge only</span>
+      </div>
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">SYSTEM PROMPT <span class="p-hint">— sets AI persona / behavior for the session</span></span>
+      <textarea class="p-sys" id="p-sys" rows="3" placeholder="Optional system prompt…"></textarea>
+    </div>
+    <div class="p-row">
+      <div class="p-lbl-row"><span class="p-lbl">TEMPERATURE <span class="p-hint">— creativity/randomness (0=precise · 1=balanced · 2=wild)</span></span><span class="p-val" id="p-tv">0.70</span></div>
+      <input type="range" class="p-slider" id="p-temp" min="0" max="2" step="0.05" value="0.7">
+    </div>
+    <div class="p-row">
+      <div class="p-lbl-row"><span class="p-lbl">TOP P <span class="p-hint">— token diversity (lower=safer word choices · higher=more varied)</span></span><span class="p-val" id="p-pv">0.95</span></div>
+      <input type="range" class="p-slider" id="p-topp" min="0" max="1" step="0.05" value="0.95">
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">MAX TOKENS <span class="p-hint">— max length of AI response (256–8192)</span></span>
+      <input type="number" class="p-num" id="p-maxtok" min="256" max="8192" value="2048">
+    </div>
+  </div>
+</div>
+
+<div class="feed" id="feed">${bubbles}</div>
+
+<footer class="ft">
+  <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="500" rows="1"></textarea>
+  <button class="ft-go" id="ft-go" title="Send">↑</button>
+</footer>
+</div>
+
 <script>
-// Pause meta-refresh while textarea has content or focus so the page
-// doesn't reload under the user's fingers while they're typing.
-//
-// idleInterval is baked in by the server:
-//   "4"    -> mic is live OR AI is currently processing (must keep polling)
-//   "3600" -> mic is muted AND AI is idle (freeze for comfortable typing)
-// Pausing always forces 3600. Resuming restores the server-specified rate.
 (function(){
-  var ta=document.querySelector('.typeinput');
-  var mr=document.getElementById('mr');
-  if(!ta||!mr)return;
-  var idleInterval='${refreshSecs}';
-  var pauseInterval='3600';
-  function pause(){mr.setAttribute('content',pauseInterval);}
-  function resume(){if(!ta.value.trim())mr.setAttribute('content',idleInterval);}
-  ta.addEventListener('focus',pause);
-  ta.addEventListener('blur',resume);
-  ta.addEventListener('input',function(){
-    if(ta.value.trim()){pause();}else{resume();}
+  var sp=new URLSearchParams(window.location.search);
+  var tok=sp.get('token')||sp.get('t')||'';
+  var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
+  var pOpen=false;
+
+  window.toggleP=function(){
+    pOpen=!pOpen;
+    var b=document.getElementById('params-body');
+    var c=document.getElementById('params-chev');
+    if(b) b.style.display=pOpen?'flex':'none';
+    if(c) c.textContent=pOpen?'▲':'▼';
+  };
+
+  function deb(fn,ms){var t;return function(){clearTimeout(t);t=setTimeout(fn,ms);};}
+
+  function sendParams(){
+    var sys=document.getElementById('p-sys');
+    var temp=document.getElementById('p-temp');
+    var topp=document.getElementById('p-topp');
+    var mt=document.getElementById('p-maxtok');
+    var mdl=document.getElementById('p-model');
+    var ws=document.getElementById('p-ws');
+    if(!sys||!temp||!topp||!mt) return;
+    fetch('/api/params'+authQ,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        systemPrompt:sys.value,temperature:parseFloat(temp.value),
+        topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
+        model:mdl?mdl.value:'',webSearch:ws?ws.checked:true
+      })
+    }).catch(function(){});
+  }
+  var dSend=deb(sendParams,600);
+
+  var pendingMdl='';
+  fetch('/api/models')
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){
+      if(!d||!d.models) return;
+      var sel=document.getElementById('p-model');
+      if(!sel) return;
+      d.models.forEach(function(m){var o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);});
+      if(pendingMdl) sel.value=pendingMdl;
+    }).catch(function(){});
+
+  fetch('/api/params'+authQ)
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){
+      if(!d) return;
+      var sys=document.getElementById('p-sys');
+      var temp=document.getElementById('p-temp');
+      var tv=document.getElementById('p-tv');
+      var topp=document.getElementById('p-topp');
+      var pv=document.getElementById('p-pv');
+      var mt=document.getElementById('p-maxtok');
+      var mdl=document.getElementById('p-model');
+      var ws=document.getElementById('p-ws');
+      var wsh=document.getElementById('p-ws-hint');
+      if(sys) sys.value=d.systemPrompt||'';
+      if(temp&&tv){temp.value=d.temperature;tv.textContent=parseFloat(d.temperature).toFixed(2);}
+      if(topp&&pv){topp.value=d.topP;pv.textContent=parseFloat(d.topP).toFixed(2);}
+      if(mt) mt.value=d.maxTokens;
+      if(d.model!==undefined){pendingMdl=d.model;if(mdl) mdl.value=d.model;}
+      if(ws&&d.webSearch!==undefined){
+        ws.checked=!!d.webSearch;
+        if(wsh) wsh.textContent=d.webSearch?'🔍 ON — live web results injected':'OFF — model knowledge only';
+      }
+    }).catch(function(){});
+
+  var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
+  if(tempEl&&tvEl){
+    tempEl.addEventListener('input',function(){tvEl.textContent=parseFloat(this.value).toFixed(2);});
+    tempEl.addEventListener('change',sendParams);
+  }
+  var toppEl=document.getElementById('p-topp'),pvEl=document.getElementById('p-pv');
+  if(toppEl&&pvEl){
+    toppEl.addEventListener('input',function(){pvEl.textContent=parseFloat(this.value).toFixed(2);});
+    toppEl.addEventListener('change',sendParams);
+  }
+  var mdlEl=document.getElementById('p-model');
+  if(mdlEl) mdlEl.addEventListener('change',sendParams);
+  var wsEl=document.getElementById('p-ws'),wshEl=document.getElementById('p-ws-hint');
+  if(wsEl) wsEl.addEventListener('change',function(){
+    var on=wsEl.checked;
+    if(wshEl) wshEl.textContent=on?'🔍 ON — live web results injected':'OFF — model knowledge only';
+    fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webSearch:on})}).catch(function(){});
   });
+  var mtEl=document.getElementById('p-maxtok');
+  if(mtEl){mtEl.addEventListener('change',sendParams);mtEl.addEventListener('blur',sendParams);}
+  var sysEl=document.getElementById('p-sys');
+  if(sysEl){sysEl.addEventListener('blur',sendParams);sysEl.addEventListener('input',dSend);}
+
+  window.toggleTTSEngine=function(){
+    fetch('/tts-engine'+authQ,{method:'POST'})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var chip=document.getElementById('chip-engine');
+        if(chip) chip.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
+      }).catch(function(){});
+  };
+
+  window.toggleTTS=function(){
+    fetch('/tts'+authQ,{method:'POST'})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var chip=document.getElementById('chip-tts');
+        if(chip){chip.textContent=d.ttsEnabled?'🔊 VOICE ON':'🔇 VOICE OFF';
+          if(d.ttsEnabled){chip.classList.remove('off');}else{chip.classList.add('off');}}
+      }).catch(function(){});
+  };
+
+  // Auto-resize textarea
+  var inp=document.getElementById('ft-inp');
+  if(inp) inp.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px';});
+
+  // AJAX send (no page reload)
+  var btn=document.getElementById('ft-go');
+  function doSend(){
+    (function(){ var p=document.getElementById('_kplayer'); if(!p){p=document.createElement('audio');p.id='_kplayer';p.autoplay=true;document.body.appendChild(p);} p.pause(); p.src=''; p.muted=true; var s=p.play(); if(s) s.then(function(){p.muted=false;}).catch(function(){}); })();
+    var text=inp?inp.value.trim():'';
+    if(!text) return;
+    btn.disabled=true;
+    fetch('/prompt'+authQ,{
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'text='+encodeURIComponent(text)
+    }).then(function(){
+      if(inp){inp.value='';inp.style.height='auto';}
+      btn.disabled=false;
+      // If a reload was deferred while user was typing, fire it now that input is clear
+      if(inp && inp.dataset.pendingReload){
+        delete inp.dataset.pendingReload;
+        window.location.reload();
+      }
+    }).catch(function(){btn.disabled=false;});
+  }
+  if(btn) btn.addEventListener('click',doSend);
+  if(inp) inp.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend();}});
+
+  // Scroll feed to bottom
+  var feed=document.getElementById('feed');
+  if(feed) feed.scrollTop=feed.scrollHeight;
 })();
 </script>
 </body>
@@ -263,16 +800,16 @@ const EXPIRED_PAGE_HTML = `<!DOCTYPE html>
 <title>Session Expired — GeauxAiPrompt</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{background:#080c10;color:#e2e8f0;font-family:system-ui,sans-serif;
+html,body{background:#0f0d1a;color:#e2e8f0;font-family:system-ui,sans-serif;
   min-height:100%;display:flex;align-items:center;justify-content:center;
   text-align:center;padding:32px}
 .wrap{max-width:300px}
 .icon{font-size:40px;margin-bottom:16px}
-h2{font-size:17px;color:#06b6d4;margin-bottom:10px;font-family:monospace;letter-spacing:.05em}
-p{font-size:13px;color:#64748b;line-height:1.65}
+h2{font-size:17px;color:#a78bfa;margin-bottom:10px;font-family:monospace;letter-spacing:.05em}
+p{font-size:13px;color:#6b7280;line-height:1.65}
 </style>
 </head>
-<body>
+<body><audio id="_kplayer" style="display:none" preload="auto"></audio>
 <div class="wrap">
   <div class="icon">🔄</div>
   <h2>SESSION EXPIRED</h2>
@@ -280,25 +817,6 @@ p{font-size:13px;color:#64748b;line-height:1.65}
   Reopen <strong style="color:#e2e8f0">GeauxAiPrompt</strong> from the<br>
   Mentra app to get a fresh link.</p>
 </div>
-<script>
-// Pause meta-refresh while textarea has content or focus
-// Server already sets 3600 when mic is muted — this is a belt-and-suspenders
-// backup for when mic is live and user wants to type.
-(function(){
-  var ta=document.querySelector('.typeinput');
-  var mr=document.getElementById('mr');
-  if(!ta||!mr)return;
-  var liveInterval='4';
-  var pauseInterval='3600';
-  function pause(){mr.setAttribute('content',pauseInterval);}
-  function resume(){if(!ta.value.trim())mr.setAttribute('content',liveInterval);}
-  ta.addEventListener('focus',pause);
-  ta.addEventListener('blur',resume);
-  ta.addEventListener('input',function(){
-    if(ta.value.trim()){pause();}else{resume();}
-  });
-})();
-</script>
 </body>
 </html>`;
 
@@ -307,7 +825,13 @@ class GeauxAIApp extends AppServer {
 
   protected async onSession(session: AppSession, sessionId: string, userId: string) {
     console.log(`[Session] Connected: ${userId}`);
+    try {
+      await session.dashboard.mode.set({ enabled: true, alwaysOn: true });
+      const modelShort = (AI_MODEL || 'ollama').split(':')[0].slice(0, 20);
+      await session.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` });
+    } catch {}
     activeSessions.set(userId, session);
+    await writeDashboard(session, userId);
 
     // ── Suppress known harmless SDK noise ─────────────────────────────────────
     // The G1 glasses send "device_state_update" messages that the current SDK
@@ -326,9 +850,9 @@ class GeauxAIApp extends AppServer {
       };
     }
 
-    await session.layouts.showTextWall(
-      'GeauxAI Labs\nGeauxAiPrompt Ready\n\nSpeak to send prompts.\nChat log visible on phone.'
-    );
+    try { await session.layouts.showDoubleTextWall('GeauxAI  ready', 'Say "Go AI" then speak\nChat log on your phone'); } catch {
+      try { await session.layouts.showTextWall('GeauxAI ready'); } catch {}
+    }
 
     // ── Button handler ────────────────────────────────────────────────────────
     // G1 has two TouchBars (left temple / right temple).
@@ -358,6 +882,10 @@ class GeauxAIApp extends AppServer {
 
       const s = getState(userId);
 
+      // Any button press cancels both auto-clear timers
+      cancelAutoClearTimer(userId);
+      cancelStatusClearTimer(userId);
+
       // Long press on either side = clear history (unchanged from previous behaviour)
       if (pressType === 'long' || pressType === 'long_press') {
         s.history     = [];
@@ -365,7 +893,7 @@ class GeauxAIApp extends AppServer {
         s.pages       = [];
         s.pageIndex   = 0;
         console.log(`[Button] Long press — history cleared for ${userId}`);
-        try { await session.layouts.showTextWall('History cleared.\nReady for new prompts.'); } catch {}
+        await showStatusOnGlasses(session, userId, 'History cleared.\nReady for new prompts.');
         return;
       }
 
@@ -395,44 +923,103 @@ class GeauxAIApp extends AppServer {
 
         if (newIndex === s.pageIndex && isLeft  && s.pageIndex === 0) {
           console.log(`[Button] Already at first page`);
-          try { await session.layouts.showTextWall(`Page 1 of ${s.pages.length}\n(Already at start)\n\n${s.pages[0]}`); } catch {}
+          try { await session.layouts.showDoubleTextWall(`GeauxAI  1/${s.pages.length}`, s.pages[0]); } catch {}
           return;
         }
         if (newIndex === s.pageIndex && !isLeft && s.pageIndex === s.pages.length - 1) {
           console.log(`[Button] Already at last page`);
-          try { await session.layouts.showTextWall(`Page ${s.pages.length} of ${s.pages.length}\n(End of response)\n\n${s.pages[s.pageIndex]}`); } catch {}
+          try { await session.layouts.showDoubleTextWall(`GeauxAI  ${s.pages.length}/${s.pages.length}`, s.pages[s.pageIndex]); } catch {}
           return;
         }
 
         s.pageIndex = newIndex;
         const suffix = `\n(${s.pageIndex + 1}/${s.pages.length})`;
         console.log(`[Button] ${isLeft ? 'LEFT←prev' : 'RIGHT→next'} → page ${s.pageIndex + 1}/${s.pages.length}`);
-        try { await session.layouts.showTextWall(s.pages[s.pageIndex] + suffix); } catch {}
+        try { await session.layouts.showDoubleTextWall(`GeauxAI  ${s.pageIndex + 1}/${s.pages.length}`, s.pages[s.pageIndex]); } catch {}
       }
     });
 
-    // Transcription: always-on mic
+    // Transcription: always-on mic, gated by wake word
     session.events.onTranscription(async (data: any) => {
-      if (!data.isFinal) return;
       const s2 = getState(userId);
       if (s2.micMuted) return;  // mic toggled off from webview
-      const text = data.text?.trim();
+      const transcript = data.text?.trim() || '';
+      if (!data.isFinal) {
+        // Interim result — show voice activity indicator
+        if (transcript.length >= 3) {
+          s2.isListening = true;
+          broadcastToUser(userId, 'listening', { active: true, partial: transcript.trim() });
+        }
+        return;
+      }
+      // Final result
+      s2.isListening = false;
+      broadcastToUser(userId, 'listening', { active: false, partial: '' });
+      const text = transcript;
       if (!text || text.length < 3) return;
-      await handlePrompt(userId, text, session);
+      // Wake word check — voice-only; typed /prompt bypasses this entirely
+      if (!text.toLowerCase().startsWith(WAKE_WORD)) return;
+      const stripped = text.slice(WAKE_WORD.length).replace(/^[,\s]+/, '').trim();
+      if (!stripped) return;
+      console.log(`[WakeWord] Triggered: "${stripped}"`);
+      await handlePrompt(userId, stripped, session);
     });
+
+    // Device state polling — SDK does not expose onDeviceStateChange; instead
+    // we poll session.device every 30 s and broadcast when values change.
+    const devicePollInterval = setInterval(() => {
+      try {
+        const dev = session?.device;
+        if (!dev) return;
+        const snap = {
+          batteryLevel:  dev.batteryLevel  ?? null,
+          charging:      dev.charging      ?? false,
+          wifiConnected: dev.wifiConnected ?? false,
+        };
+        const current = getState(userId).deviceState;
+        if (!current ||
+            current.batteryLevel  !== snap.batteryLevel  ||
+            current.charging      !== snap.charging      ||
+            current.wifiConnected !== snap.wifiConnected) {
+          getState(userId).deviceState = snap;
+          broadcastToUser(userId, 'device', snap);
+        }
+      } catch {}
+    }, 30000);
+    devicePollIntervals.set(userId, devicePollInterval);
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string) {
     console.log(`[Session] Stopped: ${userId} (${reason})`);
     activeSessions.delete(userId);
+    const pollInterval = devicePollIntervals.get(userId);
+    if (pollInterval !== undefined) {
+      clearInterval(pollInterval);
+      devicePollIntervals.delete(userId);
+    }
   }
 
   public addRoutes() {
     const app = this.getExpressApp();
 
+    // Place assets/MainLogo.png in your project root (same dir as src/)
+    // The logo is served at GET /logo.png
+    app.get('/logo.png', async (_req: any, res: any) => {
+      try {
+        const file = Bun.file('assets/MainLogo.png');
+        const buf  = await file.arrayBuffer();
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.end(Buffer.from(buf));
+      } catch {
+        res.status(404).end('Logo not found');
+      }
+    });
+
     // Required: parse urlencoded form bodies (textarea POST sends text=... urlencoded)
-    // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add it here.
+    // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add both here.
     app.use(require('express').urlencoded({ extended: false }));
+    app.use(require('express').json());
 
     // ── Per-request user resolver ─────────────────────────────────────────────
     // The SDK auth middleware sets req.authUserId from the signed token on every
@@ -460,34 +1047,13 @@ class GeauxAIApp extends AppServer {
       }
       const userId = resolveUser(req);
       const s = getState(userId);
-      // ── Refresh rate logic ────────────────────────────────────────────────
-      // When mic is muted the page normally polls at 3600s (basically never)
-      // so the user can type without the page reloading under their fingers.
-      //
-      // BUT: when a typed prompt is processing we MUST keep polling fast so
-      // the AI response appears.  We use isProcessing (not pendingRefresh)
-      // as the authority, because pendingRefresh is consumed on the FIRST
-      // GET /webview (which lands before Ollama even starts thinking).
-      // pendingRefresh still gates the initial switch from 3600→4, but we
-      // stay at "4" for the ENTIRE duration of processing.
-      //
-      // State machine:
-      //   mic live  → always "4"
-      //   mic muted, idle         → "3600"  (user can type comfortably)
-      //   mic muted, processing   → "4"     (must show AI response when done)
-      //   mic muted, pending (just submitted, not yet processing) → "4"
-      const activelyProcessing = s.isProcessing || s.pendingRefresh;
-      if (s.pendingRefresh && !s.isProcessing) {
-        // AI finished between the POST /prompt and this GET — clear flag
-        s.pendingRefresh = false;
-      }
-      const refreshSecs = (s.micMuted && !activelyProcessing) ? '3600' : '4';
       const html = buildPage(
         activeSessions.has(userId),
         s.isProcessing,
         s.history,
         s.micMuted,
-        refreshSecs
+        s.ttsEnabled,
+        s.ttsEngine
       );
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -499,30 +1065,66 @@ class GeauxAIApp extends AppServer {
     // then redirects back so the browser reloads a fresh empty page.
     app.post('/clear', async (req: any, res: any) => {
       const userId = resolveUser(req);
+      cancelAutoClearTimer(userId);
       const s = getState(userId);
       s.history = [];
       s.lastResponse = '';
       s.pages = [];
       s.pageIndex = 0;
       console.log(`[WebClear] History cleared for ${userId}`);
+      broadcastToUser(userId, 'state', { processing: false, searching: false, micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine, connected: activeSessions.has(userId), reload: true });
       const session = activeSessions.get(userId);
       if (session) {
-        try { await session.layouts.showTextWall('History cleared.\nReady for new prompts.'); } catch {}
+        await showStatusOnGlasses(session, userId, 'History cleared.\nReady for new prompts.');
       }
       res.redirect(303, '/webview');
     });
 
     app.post('/mic', async (req: any, res: any) => {
       const userId = resolveUser(req);
+      cancelAutoClearTimer(userId);
       const s = getState(userId);
       s.micMuted = !s.micMuted;
       console.log(`[MicToggle] ${userId} micMuted=${s.micMuted}`);
+      broadcastToUser(userId, 'state', { processing: s.isProcessing, searching: false, micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine, connected: activeSessions.has(userId), reload: false });
       const session = activeSessions.get(userId);
       if (session) {
+        if (s.micMuted) {
+          try { await session.dashboard.write({ text: '🔇 Mic off' }); } catch {}
+        } else {
+          const modelShort = AI_MODEL.split(':')[0].slice(0, 15);
+          try { await session.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` }); } catch {}
+        }
         const msg = s.micMuted ? 'Microphone muted.\nTap MIC ON in the app to resume.' : 'Microphone active.\nSpeak into your glasses.';
-        try { await session.layouts.showTextWall(msg); } catch {}
+        await showStatusOnGlasses(session, userId, msg);
       }
       res.redirect(303, '/webview');
+    });
+
+    app.post('/tts', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const s = getState(userId);
+      s.ttsEnabled = !s.ttsEnabled;
+      console.log(`[TTSToggle] ${userId} ttsEnabled=${s.ttsEnabled}`);
+      broadcastToUser(userId, 'state', {
+        processing: s.isProcessing, searching: false,
+        micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
+        connected: activeSessions.has(userId), reload: false,
+      });
+      res.json({ ok: true, ttsEnabled: s.ttsEnabled });
+    });
+
+    app.post('/tts-engine', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const s = getState(userId);
+      s.ttsEngine = s.ttsEngine === 'kokoro' ? 'elevenlabs' : 'kokoro';
+      console.log(`[TTSEngine] ${userId} ttsEngine=${s.ttsEngine}`);
+      broadcastToUser(userId, 'state', {
+        processing: s.isProcessing, searching: false,
+        micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
+        connected: activeSessions.has(userId), reload: false,
+      });
+      res.json({ ok: true, ttsEngine: s.ttsEngine });
     });
 
     app.post('/prompt', async (req: any, res: any) => {
@@ -535,6 +1137,17 @@ class GeauxAIApp extends AppServer {
         return res.redirect(303, '/webview');
       }
       const s = getState(userId);
+      // -- Per-user rate limiting --------------------------------------------
+      const now = Date.now();
+      const rl = rateLimits.get(userId) ?? { count: 0, resetTime: now + RATE_LIMIT_WINDOW_MS };
+      if (now > rl.resetTime) { rl.count = 0; rl.resetTime = now + RATE_LIMIT_WINDOW_MS; }
+      if (rl.count >= RATE_LIMIT_MAX_REQUESTS) {
+        console.log(`[RateLimit] ${userId} hit limit`);
+        rateLimits.set(userId, rl);
+        return res.status(429).json({ error: 'Rate limit exceeded. Try again in 60s.' });
+      }
+      rl.count++;
+      rateLimits.set(userId, rl);
       if (s.isProcessing) {
         console.log('[TypePrompt] Already processing — ignored');
         return res.redirect(303, '/webview');
@@ -545,29 +1158,179 @@ class GeauxAIApp extends AppServer {
       res.redirect(303, '/webview');
     });
 
+    // ── SSE real-time push ────────────────────────────────────────────────────
+    // GET /api/stream — client subscribes here; server pushes 'state' events
+    app.get('/api/stream', (req: any, res: any) => {
+      const userId = resolveUser(req);
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+
+      const s = getState(userId);
+      s.sseClients.push(res);
+
+      // Send current state immediately so client doesn't wait for the first change
+      const initData = JSON.stringify({
+        processing: s.isProcessing, searching: false,
+        micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
+        connected: activeSessions.has(userId), reload: false,
+      });
+      res.write(`event: state\ndata: ${initData}\n\n`);
+
+      // Send initial device snapshot immediately (battery / charging / wifi)
+      try {
+        const dev = activeSessions.get(userId)?.device;
+        const deviceSnap = {
+          batteryLevel:  dev?.batteryLevel  ?? null,
+          charging:      dev?.charging      ?? false,
+          wifiConnected: dev?.wifiConnected ?? false,
+        };
+        s.deviceState = deviceSnap;
+        broadcastToUser(userId, 'device', deviceSnap);
+      } catch {
+        // device state not available yet, client will show ⚠️
+      }
+
+      const keepalive = setInterval(() => {
+        try { res.write('event: keepalive\ndata: {}\n\n'); } catch { clearInterval(keepalive); }
+      }, 10000);
+
+      req.on('close', () => {
+        clearInterval(keepalive);
+        const s2 = userStates.get(userId);
+        if (s2) s2.sseClients = s2.sseClients.filter(c => c !== res);
+      });
+    });
+
+    // ── Generation params API ─────────────────────────────────────────────────
+    // GET  /api/params — return current per-user gen params as JSON
+    // POST /api/params — update per-user gen params (called from webview JS)
+    app.get('/api/params', (req: any, res: any) => {
+      const userId = resolveUser(req);
+      res.json(getState(userId).genParams);
+    });
+
+    app.post('/api/params', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const s = getState(userId);
+      const b = req.body || {};
+      if (typeof b.systemPrompt === 'string')
+        s.genParams.systemPrompt = b.systemPrompt.slice(0, 2000);
+      if (typeof b.temperature === 'number')
+        s.genParams.temperature  = Math.min(2, Math.max(0, b.temperature));
+      if (typeof b.topP === 'number')
+        s.genParams.topP         = Math.min(1, Math.max(0, b.topP));
+      if (typeof b.maxTokens === 'number')
+        s.genParams.maxTokens    = Math.min(8192, Math.max(256, Math.round(b.maxTokens)));
+      if (typeof b.model === 'string')
+        s.genParams.model        = b.model.slice(0, 200);
+      if (typeof b.webSearch === 'boolean')
+        s.genParams.webSearch    = b.webSearch;
+      console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
+      const sess = activeSessions.get(userId);
+      if (sess) await writeDashboard(sess, userId);
+      res.json({ ok: true });
+    });
+
+    // ── Models API ────────────────────────────────────────────────────────────
+    // GET /api/models — no auth required; read-only metadata
+    // Returns locally available Ollama model names + the server default model.
+    app.get('/api/models', async (_req: any, res: any) => {
+      try {
+        const r = await fetch(`${OLLAMA_HOST}/api/tags`);
+        if (!r.ok) throw new Error(`Ollama tags error ${r.status}`);
+        const data = (await r.json()) as any;
+        const models: string[] = (data.models || []).map((m: any) => m.name as string);
+        res.json({ models, default: AI_MODEL });
+      } catch {
+        res.json({ models: [], default: AI_MODEL });
+      }
+    });
+
+    app.get('/tts-audio/:id', (req: any, res: any) => {
+      const entry = audioCache.get(req.params.id);
+      if (!entry || Date.now() > entry.expires) {
+        res.status(404).send('Not found');
+        return;
+      }
+      // cache expires automatically after 60s
+      res.set('Content-Type', 'audio/mpeg');
+      res.send(entry.buf);
+    });
+
     app.get('/', serve);
     app.get('/webview', serve);
     app.get('/health', (_req: any, res: any) => res.json({ status: 'healthy' }));
 
-    console.log('[Routes] / /webview /health /clear /mic /prompt registered — meta-refresh + New Chat + Mic toggle + Type prompt');
+    console.log('[Routes] / /webview /health /clear /mic /prompt /api/params /api/models /api/stream /tts-audio/:id registered');
   }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+const DEFAULT_SYSTEM = 'You are a concise AI assistant on smart glasses. Give short clear answers, 2-4 sentences max. No markdown, no bullet points, plain sentences only.';
+
+async function writeDashboard(session: AppSession, userId: string) {
+  const s = getState(userId);
+  const modelShort = (s.genParams.model || AI_MODEL).split(':')[0].slice(0, 20);
+  const micStatus  = s.micMuted ? '🔇' : '🎤';
+  try {
+    await session.dashboard.write({ text: `${micStatus} GeauxAI · ${modelShort}` });
+  } catch {}
+}
+
 async function handlePrompt(userId: string, prompt: string, session: AppSession) {
   const state = getState(userId);
-  if (state.isProcessing) return;
+  if (state.isProcessing) {
+    console.log(`[Busy] Dropped prompt for ${userId}: still processing`);
+    return;
+  }
+  cancelAutoClearTimer(userId);
+  cancelStatusClearTimer(userId);
   state.isProcessing = true;
+  broadcastToUser(userId, 'state', { processing: true, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
+  try { await session.dashboard.write({ text: 'Thinking...' }); } catch {}
   console.log(`[Prompt] "${prompt.substring(0, 60)}"`);
   try {
-    await session.layouts.showTextWall(`Thinking...\n"${truncate(prompt, 60)}"`);
+    let searchContext = '';
+    const shouldSearch = WEB_SEARCH_ENABLED && state.genParams.webSearch && detectSearchIntent(prompt);
+    if (shouldSearch) {
+      const searchPreview = truncate(prompt, 30);
+      try { await session.layouts.showDoubleTextWall('GeauxAI  searching...', searchPreview); } catch {}
+      broadcastToUser(userId, 'state', { processing: true, searching: true, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
+      try { await session.dashboard.write({ text: 'Searching web...' }); } catch {}
+      console.log(`[Search] Triggered for: "${prompt.substring(0, 60)}"`);
+      searchContext = await webSearch(prompt);
+    }
+    const thinkPreview = truncate(prompt, 30);
+    try { await session.layouts.showDoubleTextWall('GeauxAI  thinking...', thinkPreview); } catch {}
     state.history.push({ role: 'user', content: prompt });
-    const response = await callAI(state.history);
-    const clean = stripMarkdown(response);
+    // Trim history to prevent context overflow before sending to AI
+    if (state.history.length > MAX_HISTORY_PAIRS * 2) {
+      state.history = state.history.slice(-(MAX_HISTORY_PAIRS * 2));
+    }
+    const response = await callAI(state.history, state.genParams, searchContext);
+    // Sanity check: detect runaway/looping response before display
+    let safeResponse = response;
+    if (response.length > MAX_RESPONSE_CHARS) {
+      const chunk = response.slice(0, 30);
+      const repeatCount = (response.match(
+        new RegExp(chunk.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')
+      ) || []).length;
+      if (repeatCount >= 3) {
+        console.log('[AI] ⚠️ Runaway/looping response detected, truncating');
+        safeResponse = response.slice(0, MAX_RESPONSE_CHARS) + '... [response truncated]';
+      } else {
+        safeResponse = response.slice(0, MAX_RESPONSE_CHARS);
+      }
+    }
+    const clean = stripMarkdown(safeResponse);
     console.log(`[AI] "${clean.substring(0, 80)}"`);
     state.history.push({ role: 'assistant', content: clean });
     state.lastResponse = clean;
-    if (state.history.length > 40) state.history = state.history.slice(-40);
+    if (state.history.length > MAX_HISTORY_PAIRS * 2) {
+      state.history = state.history.slice(-(MAX_HISTORY_PAIRS * 2));
+    }
 
     // ── Release processing lock BEFORE showOnGlasses ─────────────────────
     // showOnGlasses sleeps PAGE_DELAY (5s) between each glasses page.
@@ -578,74 +1341,144 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     // while showOnGlasses quietly pages through the glasses display in the bg.
     state.isProcessing  = false;
     state.pendingRefresh = false;
+    broadcastToUser(userId, 'state', { processing: false, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: true });
 
-    await showOnGlasses(session, clean, userId);
+    const modelUsed = (state.genParams.model.trim() || AI_MODEL);
+    const modelShort15 = modelUsed.split(':')[0].slice(0, 15);
+    try { await session.dashboard.write({ text: `✓ GeauxAI · ${modelShort15}` }); } catch {}
+    await showOnGlasses(session, clean, !!searchContext, userId);
+    // TTS — speak response if enabled for this user
+    if (state.ttsEnabled) {
+      if (state.ttsEngine === 'kokoro') {
+        speakWithKokoro(userId, clean).catch(() => {}); // fire-and-forget, never blocks display
+      } else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
+        speakWithElevenLabs(session, clean).catch(() => {});
+      }
+    }
   } catch (err: any) {
     console.error(`[Error]`, err.message);
-    try { await session.layouts.showTextWall(`Error:\n${truncate(err.message, 80)}`); } catch {}
+    try { await session.layouts.showDoubleTextWall('GeauxAI  error', truncate(err.message, 80)); } catch {}
     if (state.history.length && state.history[state.history.length - 1].role === 'user') state.history.pop();
     state.isProcessing  = false;
     state.pendingRefresh = false;
   }
 }
 
-async function callAI(history: { role: string; content: string }[]): Promise<string> {
-  const system = 'You are a concise AI assistant on smart glasses. Give short clear answers, 2-4 sentences max. No markdown, no bullet points, plain sentences only.';
+async function callAI(history: { role: string; content: string }[], params: GenParams, searchContext?: string): Promise<string> {
+  // Use the user's custom system prompt if set, otherwise fall back to the built-in default.
+  const mainSystem = params.systemPrompt.trim() || DEFAULT_SYSTEM;
+  // Use per-user selected model if set, otherwise fall back to server default.
+  const modelToUse = params.model.trim() || AI_MODEL;
+
   if (AI_PROVIDER === 'ollama') {
+    const messages = searchContext
+      ? [{ role: 'system', content: searchContext }, { role: 'system', content: mainSystem }, ...history]
+      : [{ role: 'system', content: mainSystem }, ...history];
     const r = await fetch(`${OLLAMA_HOST}/api/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: AI_MODEL, messages: [{ role: 'system', content: system }, ...history], stream: false }),
+      body: JSON.stringify({
+        model: modelToUse,
+        messages,
+        stream: false,
+        options: {
+          temperature: params.temperature,
+          top_p:       params.topP,
+          num_predict: params.maxTokens,
+        },
+      }),
     });
     if (!r.ok) throw new Error(`Ollama error ${r.status}`);
     return ((await r.json()) as any).message?.content?.trim() || 'No response.';
   }
+
   if (AI_PROVIDER === 'anthropic') {
+    const system = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: AI_MODEL, system, messages: history, max_tokens: 300 }),
+      body: JSON.stringify({
+        model: modelToUse,
+        system,
+        messages:    history,
+        max_tokens:  params.maxTokens,
+        temperature: params.temperature,
+        top_p:       params.topP,
+      }),
     });
     if (!r.ok) throw new Error(`Anthropic error ${r.status}`);
     return ((await r.json()) as any).content?.find((b: any) => b.type === 'text')?.text?.trim() || 'No response.';
   }
+
+  // OpenAI (default)
+  const messages = searchContext
+    ? [{ role: 'system', content: searchContext }, { role: 'system', content: mainSystem }, ...history]
+    : [{ role: 'system', content: mainSystem }, ...history];
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_KEY}` },
-    body: JSON.stringify({ model: AI_MODEL, messages: [{ role: 'system', content: system }, ...history], max_tokens: 300 }),
+    body: JSON.stringify({
+      model: modelToUse,
+      messages,
+      max_tokens:  params.maxTokens,
+      temperature: params.temperature,
+      top_p:       params.topP,
+    }),
   });
   if (!r.ok) throw new Error(`OpenAI error ${r.status}`);
   return ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
 }
 
-async function showOnGlasses(session: AppSession, text: string, userId?: string) {
+async function showOnGlasses(
+  session: AppSession,
+  text: string,
+  fromSearch: boolean = false,
+  userId?: string
+) {
+  if (!text?.trim()) return;
   const pages = paginate(text);
-  // If we have a userId, store pages for button navigation
+  const userState = userId ? getState(userId) : null;
+  if (userState) {
+    userState.pages     = pages;
+    userState.pageIndex = 0;
+  }
+
+  // showDoubleTextWall: native two-zone layout — label on top, content below.
+  // No manual dashes needed — the glasses render the two zones distinctly.
+  // showReferenceCard and showDashboardCard are banned — SDK bugs on G1.
+  for (let i = 0; i < pages.length; i++) {
+    const pageText = pages[i];
+    const total    = pages.length;
+    const isLast   = i === pages.length - 1;
+    const tag      = fromSearch ? 'GeauxAI  [web]' : 'GeauxAI';
+    const topText  = total > 1 ? `${tag}  ${i + 1}/${total}` : tag;
+    try {
+      await session.layouts.showDoubleTextWall(topText, pageText);
+    } catch {
+      try { await session.layouts.showTextWall(pageText); } catch {}
+    }
+    if (!isLast) await sleep(PAGE_DELAY);
+  }
+
+  // Start auto-clear timer after the final page is shown
   if (userId) {
     const s = getState(userId);
-    s.pages     = pages;
-    s.pageIndex = 0;
-  }
-  // Always show page 1 immediately
-  const suffix = pages.length > 1 ? `\n(1/${pages.length})` : '';
-  try { await session.layouts.showTextWall(pages[0] + suffix); } catch {}
-  // Auto-advance remaining pages with PAGE_DELAY so user still gets
-  // the auto-scroll experience for short multi-page responses,
-  // but they can also press buttons to jump manually at any time.
-  for (let i = 1; i < pages.length; i++) {
-    await sleep(PAGE_DELAY);
-    // Only auto-advance if user hasn't manually navigated away from expected position
-    if (userId) {
-      const s = getState(userId);
-      // If user pressed a button and moved off this page, stop auto-advancing
-      if (s.pageIndex !== i - 1) break;
-      s.pageIndex = i;
-    }
-    const sfx = `\n(${i + 1}/${pages.length})`;
-    try { await session.layouts.showTextWall(pages[i] + sfx); } catch { return; }
+    if (s.ttsEnabled && s.ttsEngine === 'kokoro') { return; }
+    cancelAutoClearTimer(userId);
+    s.autoClearTimer = setTimeout(async () => {
+      s.autoClearTimer = null;
+      const activeSession = activeSessions.get(userId!);
+      if (activeSession) {
+        try { await activeSession.layouts.clearView(); } catch {}
+        const modelShort = AI_MODEL.split(':')[0].slice(0, 20);
+        try { await activeSession.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` }); } catch {}
+        console.log(`[AutoClear] Display cleared for ${userId}`);
+      }
+    }, AUTO_CLEAR_DELAY_MS);
+    console.log(`[AutoClear] Timer started for ${userId} (${AUTO_CLEAR_DELAY_MS}ms)`);
   }
 }
 
-function paginate(text: string, cpl = 38, lpp = 5): string[] {
+function paginate(text: string, cpl = 34, lpp = 4): string[] {
   const words = text.split(/\s+/);
   const lines: string[] = [];
   let cur = '';
@@ -671,6 +1504,165 @@ function truncate(t: string, max: number): string {
 
 function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
 
+async function webSearch(query: string): Promise<string> {
+  if (!TAVILY_API_KEY || !WEB_SEARCH_ENABLED) return '';
+  try {
+    const r = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${TAVILY_API_KEY}`,
+      },
+      body: JSON.stringify({
+        query,
+        search_depth:        'basic',
+        include_answer:       true,
+        include_raw_content:  false,
+        max_results:          5,
+        topic:               'general',
+      }),
+    });
+    if (!r.ok) { console.log(`[WebSearch] Tavily error: HTTP ${r.status}`); return ''; }
+    const data = await r.json() as any;
+
+    const lines: string[] = [];
+    const now = new Date().toISOString();
+    lines.push('===WEB SEARCH RESULTS===');
+    lines.push(`Query: "${query}"`);
+    lines.push(`Date: ${now}`);
+    lines.push('');
+
+    if (data.answer && data.answer.trim()) {
+      lines.push(`Summary: ${data.answer.trim()}`);
+      lines.push('');
+    }
+
+    const results = (data.results || []).slice(0, 4);
+    results.forEach((res: any, i: number) => {
+      const title   = (res.title   || '').trim();
+      const content = (res.content || '').trim().substring(0, 200);
+      if (title || content) {
+        lines.push(`${i + 1}. ${title}`);
+        if (content) lines.push(`   ${content}`);
+        lines.push('');
+      }
+    });
+
+    lines.push('===END SEARCH RESULTS===');
+    lines.push(`Use these results to answer. Today's date is ${now}.`);
+
+    const count = results.length;
+    if (count === 0 && !data.answer) {
+      console.log(`[WebSearch] No results for: "${query}"`);
+      return '';
+    }
+    console.log(`[WebSearch] Tavily "${query}" → ${count} results` + (data.answer ? ' + summary' : ''));
+    return lines.join('\n');
+  } catch (err: any) {
+    console.log(`[WebSearch] Failed: ${err.message}`);
+    return '';
+  }
+}
+
+async function speakWithElevenLabs(session: AppSession, text: string): Promise<void> {
+  if (!ELEVENLABS_API_KEY) return;
+  try {
+    const safeText = text.length > 2500 ? text.slice(0, 2497) + '...' : text;
+    const result = await session.audio.speak(safeText, {
+      voice_id: ELEVENLABS_VOICE_ID,
+      model_id: 'eleven_flash_v2_5',
+      voice_settings: {
+        stability: 0.5,
+        similarity_boost: 0.75,
+      },
+    });
+    if (result.success) {
+      console.log(`[TTS] Spoke ${safeText.length} chars via MentraOS audio`);
+    } else {
+      console.log(`[TTS] Speak failed: ${result.error}`);
+    }
+  } catch (err: any) {
+    console.log(`[TTS] Failed: ${err.message}`);
+  }
+}
+
+async function speakWithKokoro(userId: string, text: string): Promise<void> {
+  try {
+    const safeText = text.length > 2500 ? text.slice(0, 2497) + '...' : text;
+    const r = await fetch(`${KOKORO_HOST}/v1/audio/speech`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'kokoro',
+        input: safeText,
+        voice: KOKORO_VOICE,
+        response_format: 'mp3',
+        speed: 1.0,
+      }),
+    });
+    if (!r.ok) {
+      console.log(`[TTS] Kokoro error ${r.status}`);
+      return;
+    }
+    const audioBuffer = Buffer.from(await r.arrayBuffer());
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    audioCache.set(id, { buf: audioBuffer, expires: Date.now() + 300_000 });
+    const audioUrl = `/tts-audio/${id}`;
+    broadcastToUser(userId, 'tts_audio', { url: audioUrl });
+    console.log(`[TTS] Kokoro → SSE audio push (${safeText.length} chars, voice: ${KOKORO_VOICE})`);
+    cancelAutoClearTimer(userId);
+    const ks = getState(userId);
+    ks.autoClearTimer = setTimeout(async () => {
+      ks.autoClearTimer = null;
+      const kSession = activeSessions.get(userId);
+      if (kSession) {
+        try { await kSession.layouts.clearView(); } catch {}
+        const modelShort = AI_MODEL.split(':')[0].slice(0, 20);
+        try { await kSession.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` }); } catch {}
+        console.log(`[AutoClear] Display cleared for ${userId}`);
+      }
+    }, AUTO_CLEAR_DELAY_MS);
+    console.log(`[AutoClear] Timer started for ${userId} (${AUTO_CLEAR_DELAY_MS}ms) [post-Kokoro]`);
+  } catch (err: any) {
+    console.log(`[TTS] Kokoro failed: ${err.message}`);
+  }
+}
+
+function detectSearchIntent(prompt: string): boolean {
+  const p = prompt.toLowerCase();
+  const signals = [
+    // Time/recency
+    'today','tonight','right now','current','currently','latest','recent',
+    'recently','this week','this month','this year','just happened',
+    'breaking','live','now','last night','yesterday',
+    'just announced','just released','just launched','new update','update on',
+    // Questions needing live data
+    'what is the weather','weather in','weather for',
+    'what is the score','who won',"what's the score",
+    'what happened','who is the current','who is the new',
+    'what is the latest',"what's happening",'whats happening',
+    'is there a','did they announce','has it been released',
+    "what's the price",'how much does','how much is',"what's the stock",
+    'stock price','market today',
+    'who is the president','who is the ceo','who is the',
+    'what time does','when does','when did','when is',
+    'is it open','are they open','hours for',
+    'how do i get to','directions to','near me',
+    'best rated','reviews for','rating of',
+    // Explicit search requests
+    'search for','look up','find out','google',
+    'search the web','look it up','can you find',
+    'what does the internet say','find me',
+    // News and events
+    'news','score','scores','election','results',
+    'announcement','release date','coming out',
+    'box office','standings','rankings','leaderboard',
+    'championship','playoffs','season','episode',
+    'trailer','review',
+  ];
+  return signals.some(s => p.includes(s));
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 // Validate required env vars before starting
 if (!API_KEY) {
@@ -693,7 +1685,10 @@ console.log('══════════════════════�
 console.log(`  Package : ${PACKAGE_NAME}`);
 console.log(`  Port    : ${PORT}`);
 console.log(`  AI      : ${AI_PROVIDER} / ${AI_MODEL}`);
+console.log(`  Search  : ${TAVILY_API_KEY ? 'Tavily (live web)' : 'DISABLED — set TAVILY_API_KEY in .env'}`);
+console.log(`  TTS     : ${ELEVENLABS_API_KEY ? 'ElevenLabs (voice enabled)' : 'DISABLED — set ELEVENLABS_API_KEY in .env'}`);
+console.log(`  Kokoro  : ${KOKORO_HOST} (voice: ${KOKORO_VOICE})`);
 console.log(`  Mode    : VOICE ALWAYS ON + LIVE CHAT LOG`);
-console.log(`  Method  : meta-refresh every 4s, zero JS`);
+console.log(`  Method  : SSE real-time push`);
 console.log('════════════════════════════════════════════');
 console.log('');

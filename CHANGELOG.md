@@ -5,148 +5,173 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [2.0.0-beta] — 2026-03-01
+## [3.0.0] — 2026-03-14
 
 ### Summary
-This release graduates GeauxAiPrompt from alpha to beta. The core voice + typed-prompt
-pipeline is now stable end-to-end on the Even Realities G1 / MentraOS platform.
-Three critical bugs were diagnosed and fixed: two race conditions in the webview refresh
-state machine and one in the processing lock lifecycle.
-
----
-
-### Bug Fixes
-
-#### 🐛 BUG-001 — Typed prompts did not refresh the webview when mic was muted
-**Symptom:** Submitting a typed prompt with the mic toggled OFF caused the page to freeze.
-The AI response never appeared in the browser window. The page would briefly show
-"Thinking..." for one 4-second cycle then lock up for ~1 hour.
-
-**Root cause:** A race condition in the `pendingRefresh` one-shot flag.  
-`POST /prompt` set `pendingRefresh = true` and fired the AI call asynchronously, then
-immediately redirected the browser to `GET /webview`. That first `GET` consumed the flag
-(`pendingRefresh → false`) and served `content="4"`. Four seconds later the next `GET`
-saw `pendingRefresh = false` AND `micMuted = true` → served `content="3600"`. But Ollama
-hadn't finished yet (typical inference time: 5–15 seconds). The response landed in state
-after the page had already frozen at the 1-hour refresh interval.
-
-**Fix:** Changed the `refreshSecs` decision from a one-shot flag to tracking the full
-processing window. The page now serves `content="4"` for as long as `isProcessing = true`
-OR `pendingRefresh = true`, keeping fast-refresh alive for the entire duration of AI
-inference regardless of mic state. `pendingRefresh` is cleared in the `finally` block of
-`handlePrompt` so the page correctly returns to `content="3600"` (idle+muted) only after
-the response has been stored to `state.history`.
-
-```
-Before:  muted + prompt → 4s refresh → 3600s (frozen, AI still running)
-After:   muted + prompt → 4s refresh → 4s refresh → ... → AI done → 3600s (idle)
-```
-
----
-
-#### 🐛 BUG-002 — Webview showed "Thinking..." for minutes after AI had already responded
-**Symptom:** After a typed prompt completed successfully, the browser kept refreshing
-every 4 seconds and displaying the "Thinking..." status pill for an extended period
-(sometimes 20–30+ seconds) before finally settling. Observed clearly in ngrok request
-logs as a long run of `GET /webview 200 OK` every ~4 seconds post-response.
-
-**Root cause:** `isProcessing` was held `true` for the entire duration of `showOnGlasses`,
-not just the AI call. `showOnGlasses` loops through paginated glasses display pages with
-`await sleep(PAGE_DELAY)` (5 seconds) between each page. For a multi-paragraph response
-this could mean 4–6 pages × 5 seconds = 20–30 seconds of `isProcessing = true` after
-the AI had already responded. Since `isProcessing = false` only ran in the `finally`
-block (which fires after `showOnGlasses` fully resolves), the webview was locked in the
-"Thinking..." fast-refresh state the entire time.
-
-**Fix:** `isProcessing` and `pendingRefresh` are now cleared immediately after `callAI`
-returns and `state.history` is updated — before `showOnGlasses` is called. The response
-is already in state at that point so the webview renders it correctly on the next 4-second
-refresh. `showOnGlasses` continues to page through the glasses display in the background
-without blocking the web UI state.
-
-```
-Before:  AI done → showOnGlasses (sleeps 5s × N pages) → finally → isProcessing=false
-After:   AI done → isProcessing=false → showOnGlasses runs in background (non-blocking)
-```
-
----
-
-#### 🐛 BUG-003 — Page JavaScript restored wrong refresh rate after textarea blur
-**Symptom:** When mic was muted and idle (`content="3600"`), focusing and then blurring
-the textarea input would snap the meta-refresh back to `content="4"` (fast poll), causing
-unnecessary constant page reloads even when no prompt was being processed.
-
-**Root cause:** The inline JavaScript that pauses the meta-refresh on textarea focus used
-a hardcoded `liveInterval = '4'` as the "resume" value. This was correct when the mic
-was live, but incorrect when the server had intentionally served `content="3600"` for an
-idle muted session. Blurring the textarea always reset the rate to 4 seconds regardless
-of the actual server-intended interval.
-
-**Fix:** `idleInterval` is now baked into the HTML at render time by the server using the
-template literal `'${refreshSecs}'`. When the textarea is blurred, JavaScript restores
-the server-intended rate — `"4"` if the mic is live or AI is processing, `"3600"` if mic
-is muted and idle.
+Major release adding full TTS audio readback via two engines (ElevenLabs cloud and Kokoro local),
+SSE real-time push replacing meta-refresh, Tavily web search, glassmorphic UI redesign,
+multi-user support, auto-restart wrapper, and a suite of audio playback bug fixes.
+The app is now a complete voice AI assistant — it speaks responses back to you, not just
+displays them on the glasses.
 
 ---
 
 ### Added
 
-- **`isProcessing`-aware refresh logic** — the `refreshSecs` decision now uses
-  `isProcessing || pendingRefresh` as a compound guard so the webview stays in fast-poll
-  mode for the entire AI processing window, not just a single 4-second cycle.
+#### 🎙️ ElevenLabs TTS
+- AI responses read aloud via `session.audio.speak()` routing through MentraOS's proxy
+- Voice ID configurable via `ELEVENLABS_VOICE_ID` env var
+- Uses `eleven_flash_v2_5` model for low latency
+- Free — Mentra absorbs ElevenLabs cost through their proxy (confirmed: zero charges to user account)
 
-- **Early processing lock release** — `handlePrompt` releases `isProcessing = false`
-  immediately after AI responds and history is updated, before the glasses paging loop
-  begins. Web UI and glasses display are now decoupled.
+#### 🔊 Kokoro Local TTS
+- Local Docker-based TTS via `ghcr.io/remsky/kokoro-fastapi-cpu:latest` on port 8880
+- OpenAI-compatible API (`/v1/audio/speech`)
+- 67 voice packs — American, British, Japanese, Chinese, Portuguese, Korean voices
+- `KOKORO_HOST` and `KOKORO_VOICE` env vars
+- MP3 audio cached in memory with 300-second TTL
+- Audio delivered to browser via SSE `tts_audio` event → `<audio>` element
+- Fully offline, unlimited, free
 
-- **Server-baked `idleInterval` in page JS** — the meta-refresh JavaScript now receives
-  its idle rate from the server at render time instead of using a hardcoded value. The
-  correct rate is always restored after textarea blur.
+#### ⚡ TTS Engine Toggle
+- Runtime switching between ElevenLabs and Kokoro via chip button in web UI
+- Per-user engine state persisted in UserState
 
-- **`device_state_update` error suppression** — the G1 firmware sends `device_state_update`
-  WebSocket messages that the current `@mentra/sdk` version does not yet handle. Rather
-  than flooding the console with ERROR/WARN pairs on every message, the session
-  `emit` handler is monkey-patched in `onSession` to silently drop these known-harmless
-  events. Everything functions correctly; this is purely cosmetic log hygiene.
+#### 📡 SSE Real-Time Push (replaced meta-refresh)
+- `/api/stream` endpoint with `Content-Type: text/event-stream`
+- Named events: `state`, `device`, `listening`, `tts_audio`, `keepalive`
+- Per-user `sseClients` array in UserState
+- `broadcastToUser()` utility function
+- Client-side EventSource with 120-second watchdog timer
+- Server sends named `keepalive` event every 10 seconds to reset watchdog
+- Eliminated auth.middleware log flood (was ~4 hits/second per user with meta-refresh)
 
-- **Corrected `AI_MODEL` default** — default changed from `'llama3.2'` to `'llama3.2:3b'`
-  to match the actual Ollama model tag. Prevents a model-not-found error on first launch
-  with no `.env` override set.
+#### 🔍 Tavily Web Search
+- `detectSearchIntent()` automatically triggers web search for time-sensitive queries
+- Covers: news, sports scores, weather, current events, dates
+- `TAVILY_API_KEY` env var
+- Search context injected into AI prompt
+
+#### 🎨 Glassmorphic Web UI Redesign
+- Dark theme with Syne + JetBrains Mono fonts
+- Animated waveform visualizer
+- AJAX prompt submission (no page reload on send)
+- Prompt counter
+- TTS engine and voice toggle chips in header
+- Status chips: LIVE, VOICE ON/OFF, KOKORO/ELEVEN, MIC ON/OFF
+
+#### 🔄 Auto-Restart Wrapper (`start.sh`)
+- Bash wrapper restarts `bun run src/index.ts` on crash
+- Max 10 restarts with 3-second delay between attempts
+- `start-dev.sh` hot-reload variant for development using `bun --watch`
+
+#### 👥 Multi-User Support
+- `userStates` Map isolates state per userId
+- Separate conversation history, TTS settings, SSE clients, timers per user
+
+#### 📱 Android APK
+- WebView wrapper pointing to `app.geauxailabs.com`
+- `setDomStorageEnabled(true)` required for Cloudflare auth persistence
+
+#### 🔒 Cloudflare Zero Trust Access
+- Email OTP authentication on `app.geauxailabs.com`
+
+#### 🏷️ Dashboard Status Indicators
+All key lifecycle events write to the glasses dashboard bar:
+- Connect: `🎤 GeauxAI · {model}`
+- Processing: `⏳ Thinking...`
+- Searching: `🔍 Searching web...`
+- Complete: `✓ GeauxAI · {model}`
 
 ---
 
-### Unchanged / Stable Features (carried from v1.0.0-alpha)
+### Bug Fixes
 
-- Voice transcription via G1 onboard microphone (always-on, en-US)
-- Typed prompt input from the webview footer textarea
-- Mic mute / unmute toggle (persists across refreshes)
-- New Chat button (clears history server-side and on glasses)
-- Multi-page response pagination on glasses display (38 chars/line × 5 lines/page)
-- Left/right TouchBar navigation for paging through multi-page responses
-- Long-press either TouchBar to clear history
-- Session expired page (prevents 401 log flood after ~3 hour token timeout)
-- AI provider switching: Ollama (default), Anthropic, OpenAI via env vars
-- Zero-JavaScript webview rendering (meta-refresh only, works in any WebView)
-- Cache-Control: no-store on all webview responses
+#### 🐛 BUG-004 — Kokoro audio URL resolving to wrong host (503 errors)
+**Symptom:** Kokoro audio returned HTTP 503 when fetched from localhost browser.  
+**Root cause:** `speakWithKokoro()` built the audio URL using `PUBLIC_BASE_URL` (the Cloudflare tunnel domain). Browser on localhost tried to fetch from the remote URL, got 503.  
+**Fix:** Changed audio URL to relative path `/tts-audio/${id}`. Resolves correctly against whatever origin the browser is on (localhost or Cloudflare).
+
+#### 🐛 BUG-005 — Chrome double-fetches audio URL, one-shot cache delete killed second request
+**Symptom:** Audio element loaded but played no sound. Network showed 200 then 404 for the same URL.  
+**Root cause:** Chrome's `<audio>` element makes two HTTP requests per src — a metadata probe then the full stream. Original code had `audioCache.delete(req.params.id)` (one-shot delete). First request deleted the entry; second got 404.  
+**Fix:** Removed `audioCache.delete()`. Cache expires via 300-second TTL.
+
+#### 🐛 BUG-006 — AutoClear timer firing before Kokoro audio arrived
+**Symptom:** Display cleared and audio cut off mid-sentence.  
+**Root cause:** 15-second AutoClear started at AI text completion. Kokoro generation takes additional time. Timer expired before audio reached the browser.  
+**Fix 1:** `showOnGlasses()` now returns early (skips starting AutoClear) when `ttsEngine === 'kokoro'`.  
+**Fix 2:** `speakWithKokoro()` starts AutoClear only after broadcasting the audio URL to the browser.  
+**Fix 3:** `AUTO_CLEAR_DELAY_MS` default increased from 15000 → 60000ms.
+
+#### 🐛 BUG-007 — SSE watchdog reloading page mid-audio (root cause of all cutoffs)
+**Symptom:** Audio cut off randomly mid-sentence, page reloaded, `_kplayer` element disappeared from DOM.  
+**Root cause:** Server was sending SSE keepalives as comments (`: keepalive\n\n`). **SSE comments are invisible to JavaScript** — the client's EventSource never fires an event for them. The client `sseTimer` watchdog (120 seconds) only reset on `state` events. During Kokoro generation (no state events for several seconds), `safeReload()` eventually fired and called `window.location.reload()`, killing the page and audio mid-playback.  
+**Fix:** Changed server keepalive from a comment to a named SSE event (`event: keepalive\ndata: {}\n\n`) sent every 10 seconds. Added client `keepalive` event listener that resets `sseTimer`. During generation, multiple keepalives fire and the watchdog never expires.
+
+#### 🐛 BUG-008 — Audio cache TTL too short for long responses
+**Symptom:** Long responses cut off near the end of playback.  
+**Root cause:** 60-second cache TTL. Long responses: generate time + playback time could approach or exceed 60 seconds.  
+**Fix:** TTL increased from 60_000 → 300_000ms (5 minutes).
+
+#### 🐛 BUG-009 — Old audio replaying when new prompt submitted
+**Symptom:** Sending a second prompt replayed the previous response until the new one arrived.  
+**Root cause:** `doSend()` unlock IIFE called `p.play()` on `_kplayer` which still had the previous audio's `src` set.  
+**Fix:** Added `p.pause(); p.src='';` before the unlock play call in `doSend()`.
+
+#### 🐛 BUG-010 — `/tts-audio/:id` missing HTTP Range request support
+**Symptom:** Audio element stalled or stopped mid-playback on some responses.  
+**Root cause:** Chrome's audio element sends HTTP Range requests (`Range: bytes=N-`). Route returned plain 200 without `Accept-Ranges` header.  
+**Fix:** Added proper 206 Partial Content response with `Content-Range` and `Accept-Ranges: bytes` headers.
 
 ---
 
-### Known Issues
+### Changed
 
-- `device_state_update` messages from G1 firmware are suppressed but not handled.
-  Proper handling is pending `@mentra/sdk` upstream support.
-- Transcription events from the glasses mic still fire while mic is marked "muted"
-  in app state — the `onTranscription` handler guards against acting on them, but
-  the stream itself is not paused at the SDK level.
+- `AUTO_CLEAR_DELAY_MS` default: 15000 → 60000
+- audioCache TTL: 60_000 → 300_000ms
+- SSE keepalive: comment every 25s → named event every 10s
+- SSE watchdog: was reset only on `state` events → now also resets on `keepalive` events
+- AI model default: `llama3.2:3b` → `deepseek-v3.1:671b-cloud`
+- WebView: meta-refresh every 4s → SSE real-time push
 
 ---
 
-## [1.0.0-alpha] — 2026-02-01 *(initial release)*
+## [2.0.0-beta] — 2026-03-01
+
+### Summary
+Graduates GeauxAiPrompt from alpha to beta. Core voice + typed-prompt pipeline is stable
+end-to-end. Three critical race condition bugs fixed.
+
+### Bug Fixes
+
+#### 🐛 BUG-001 — Typed prompts did not refresh webview when mic muted
+**Root cause:** Race condition in `pendingRefresh` one-shot flag. `POST /prompt` set flag and fired AI async, then redirected to `GET /webview`. First GET consumed the flag → served `content="3600"` before AI finished.  
+**Fix:** `refreshSecs` now uses `isProcessing || pendingRefresh` as compound guard. Fast-refresh stays alive for entire AI inference window.
+
+#### 🐛 BUG-002 — Webview showed "Thinking..." for minutes after AI responded
+**Root cause:** `isProcessing` held `true` through entire `showOnGlasses` loop (5s sleep × N pages = 20-30s after AI done).  
+**Fix:** `isProcessing = false` released immediately after AI responds and history updated, before `showOnGlasses` begins. Glasses paging runs in background without blocking web UI.
+
+#### 🐛 BUG-003 — Textarea blur restored wrong meta-refresh rate
+**Root cause:** Hardcoded `liveInterval = '4'` in page JS. Blur always reset to 4s even when server intended 3600s.  
+**Fix:** `idleInterval` baked into HTML at render time by server. Blur restores server-intended rate.
+
+### Added
+- `isProcessing`-aware refresh logic
+- Early processing lock release
+- Server-baked `idleInterval` in page JS
+- `device_state_update` SDK error suppression
+- `AI_MODEL` default corrected to `llama3.2:3b`
+
+---
+
+## [1.0.0-alpha] — 2026-02-01
 
 - Initial MentraOS app scaffolding with `@mentra/sdk`
-- Ollama / llama3.2:3b integration via local HTTP API
-- Voice transcription → AI response → glasses TextWall display pipeline
-- Meta-refresh webview chat log (zero JavaScript)
-- Mic toggle, New Chat button, button-press page navigation
-- Multi-provider support (Ollama / Anthropic / OpenAI) via environment variables
+- Ollama / llama3.2:3b integration
+- Voice transcription → AI → glasses TextWall pipeline
+- Meta-refresh webview chat log
+- Mic toggle, New Chat, button-press page navigation
+- Multi-provider support (Ollama / Anthropic / OpenAI)
 - Package: `com.geauxailabs.geauxaiprompt`
