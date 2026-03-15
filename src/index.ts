@@ -10,8 +10,8 @@ const WAKE_WORD    = (process.env.WAKE_WORD    || 'Go AI').toLowerCase();
 const OPENAI_KEY   = process.env.OPENAI_API_KEY   || '';
 const ANTHROPIC_KEY= process.env.ANTHROPIC_API_KEY|| '';
 const OLLAMA_HOST  = process.env.OLLAMA_HOST   || 'http://localhost:11434';
-const PAGE_DELAY         = parseInt(process.env.PAGE_DELAY_MS        || '5000');
-const AUTO_CLEAR_DELAY_MS  = parseInt(process.env.AUTO_CLEAR_DELAY_MS  || '60000');
+const PAGE_DELAY         = parseInt(process.env.PAGE_DELAY_MS        || '4000');
+const AUTO_CLEAR_DELAY_MS  = parseInt(process.env.AUTO_CLEAR_DELAY_MS  || '15000');
 const STATUS_CLEAR_DELAY_MS = parseInt(process.env.STATUS_CLEAR_DELAY_MS || '5000');
 const OWNER_EMAIL  = process.env.OWNER_EMAIL || '';
 const WEB_SEARCH_ENABLED = process.env.WEB_SEARCH_ENABLED !== 'false';
@@ -21,8 +21,9 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'ZzBpNW0j7Iq2XRx6
 const KOKORO_HOST   = process.env.KOKORO_HOST   || 'http://localhost:8880';
 const KOKORO_VOICE  = process.env.KOKORO_VOICE  || 'am_eric';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://app.geauxailabs.com';
-const MAX_HISTORY_PAIRS  = 6;   // keep last 6 user+assistant pairs (12 messages)
-const MAX_RESPONSE_CHARS = 1200; // cap runaway model output before display
+const MAX_HISTORY_PAIRS  = 10;   // keep last 10 user+assistant pairs (20 messages)
+const MAX_RESPONSE_CHARS = 8000; // cap runaway model output before display
+const MAX_DISPLAY_CHARS  = 8000; // pagination handles length — no artificial cut
 const RATE_LIMIT_WINDOW_MS   = 60000;  // 60-second rolling window
 const RATE_LIMIT_MAX_REQUESTS = 10;    // max prompts per window
 
@@ -626,8 +627,8 @@ kbd{
       <input type="range" class="p-slider" id="p-topp" min="0" max="1" step="0.05" value="0.95">
     </div>
     <div class="p-row">
-      <span class="p-lbl">MAX TOKENS <span class="p-hint">— max length of AI response (256–8192)</span></span>
-      <input type="number" class="p-num" id="p-maxtok" min="256" max="8192" value="2048">
+      <span class="p-lbl">MAX TOKENS <span class="p-hint">— max length of AI response (256–32000)</span></span>
+      <input type="number" class="p-num" id="p-maxtok" min="256" max="32000" value="4096">
     </div>
   </div>
 </div>
@@ -635,7 +636,7 @@ kbd{
 <div class="feed" id="feed">${bubbles}</div>
 
 <footer class="ft">
-  <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="500" rows="1"></textarea>
+  <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="10000" rows="1"></textarea>
   <button class="ft-go" id="ft-go" title="Send">↑</button>
 </footer>
 </div>
@@ -825,13 +826,16 @@ class GeauxAIApp extends AppServer {
 
   protected async onSession(session: AppSession, sessionId: string, userId: string) {
     console.log(`[Session] Connected: ${userId}`);
+
+    // Enable dashboard with always-on overlay
     try {
       await session.dashboard.mode.set({ enabled: true, alwaysOn: true });
-      const modelShort = (AI_MODEL || 'ollama').split(':')[0].slice(0, 20);
-      await session.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` });
     } catch {}
+
     activeSessions.set(userId, session);
-    await writeDashboard(session, userId);
+
+    // Initialize dashboard — show Ready state with model info
+    updateDashboard(session, 'Ready', undefined, getState(userId).history.length);
 
     // ── Suppress known harmless SDK noise ─────────────────────────────────────
     // The G1 glasses send "device_state_update" messages that the current SDK
@@ -886,7 +890,7 @@ class GeauxAIApp extends AppServer {
       cancelAutoClearTimer(userId);
       cancelStatusClearTimer(userId);
 
-      // Long press on either side = clear history (unchanged from previous behaviour)
+      // Long press on either side = clear history
       if (pressType === 'long' || pressType === 'long_press') {
         s.history     = [];
         s.lastResponse = '';
@@ -894,6 +898,7 @@ class GeauxAIApp extends AppServer {
         s.pageIndex   = 0;
         console.log(`[Button] Long press — history cleared for ${userId}`);
         await showStatusOnGlasses(session, userId, 'History cleared.\nReady for new prompts.');
+        updateDashboard(session, 'Ready', 'History cleared', 0);
         return;
       }
 
@@ -933,7 +938,6 @@ class GeauxAIApp extends AppServer {
         }
 
         s.pageIndex = newIndex;
-        const suffix = `\n(${s.pageIndex + 1}/${s.pages.length})`;
         console.log(`[Button] ${isLeft ? 'LEFT←prev' : 'RIGHT→next'} → page ${s.pageIndex + 1}/${s.pages.length}`);
         try { await session.layouts.showDoubleTextWall(`GeauxAI  ${s.pageIndex + 1}/${s.pages.length}`, s.pages[s.pageIndex]); } catch {}
       }
@@ -1018,8 +1022,8 @@ class GeauxAIApp extends AppServer {
 
     // Required: parse urlencoded form bodies (textarea POST sends text=... urlencoded)
     // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add both here.
-    app.use(require('express').urlencoded({ extended: false }));
-    app.use(require('express').json());
+    app.use(require('express').urlencoded({ extended: false, limit: '1mb' }));
+    app.use(require('express').json({ limit: '1mb' }));
 
     // ── Per-request user resolver ─────────────────────────────────────────────
     // The SDK auth middleware sets req.authUserId from the signed token on every
@@ -1076,6 +1080,7 @@ class GeauxAIApp extends AppServer {
       const session = activeSessions.get(userId);
       if (session) {
         await showStatusOnGlasses(session, userId, 'History cleared.\nReady for new prompts.');
+        updateDashboard(session, 'Ready', 'History cleared', 0);
       }
       res.redirect(303, '/webview');
     });
@@ -1089,12 +1094,7 @@ class GeauxAIApp extends AppServer {
       broadcastToUser(userId, 'state', { processing: s.isProcessing, searching: false, micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine, connected: activeSessions.has(userId), reload: false });
       const session = activeSessions.get(userId);
       if (session) {
-        if (s.micMuted) {
-          try { await session.dashboard.write({ text: '🔇 Mic off' }); } catch {}
-        } else {
-          const modelShort = AI_MODEL.split(':')[0].slice(0, 15);
-          try { await session.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` }); } catch {}
-        }
+        updateDashboard(session, s.micMuted ? 'Mic Off' : 'Listening');
         const msg = s.micMuted ? 'Microphone muted.\nTap MIC ON in the app to resume.' : 'Microphone active.\nSpeak into your glasses.';
         await showStatusOnGlasses(session, userId, msg);
       }
@@ -1229,7 +1229,7 @@ class GeauxAIApp extends AppServer {
         s.genParams.webSearch    = b.webSearch;
       console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
       const sess = activeSessions.get(userId);
-      if (sess) await writeDashboard(sess, userId);
+      if (sess) updateDashboard(sess, 'Ready', undefined, s.history.length);
       res.json({ ok: true });
     });
 
@@ -1268,15 +1268,41 @@ class GeauxAIApp extends AppServer {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-const DEFAULT_SYSTEM = 'You are a concise AI assistant on smart glasses. Give short clear answers, 2-4 sentences max. No markdown, no bullet points, plain sentences only.';
 
-async function writeDashboard(session: AppSession, userId: string) {
-  const s = getState(userId);
-  const modelShort = (s.genParams.model || AI_MODEL).split(':')[0].slice(0, 20);
-  const micStatus  = s.micMuted ? '🔇' : '🎤';
+// Glasses-optimized system prompt: short, plain text, no markdown
+const DEFAULT_SYSTEM = 'You are a concise AI assistant on smart glasses. Give short clear answers. Use 2-4 sentences max. No markdown, no bullet points, no numbered lists. Plain sentences only. Be direct and concise. Never use asterisks, hashes, or formatting symbols.';
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+// updateDashboard writes a persistent status to the G1 always-on overlay.
+// Compact line: "GeauxAI | <status>" — always visible.
+// Expanded view: full block shown when user looks up / opens dashboard.
+// All writes are wrapped in try/catch — display failures are non-critical.
+function updateDashboard(
+  session: AppSession,
+  status: string,
+  detail?: string,
+  msgCount?: number
+) {
   try {
-    await session.dashboard.write({ text: `${micStatus} GeauxAI · ${modelShort}` });
-  } catch {}
+    // Compact always-on line
+    (session.dashboard.content as any).writeToMain(`GeauxAI | ${status}`);
+
+    // Expanded view (shown when user looks up)
+    const expanded: string[] = [
+      'GeauxAI Labs',
+      `Model: ${AI_MODEL}`,
+      `Status: ${status}`,
+    ];
+    if (detail) expanded.push(detail);
+    if (msgCount !== undefined) expanded.push(`Messages: ${msgCount}`);
+    (session.dashboard.content as any).writeToExpanded(expanded.join('\n'));
+  } catch (e) {
+    // Dashboard content API not available on this firmware — fall back silently
+    try {
+      (session.dashboard as any).write({ text: `GeauxAI | ${status}` });
+    } catch { /* non-critical, continue */ }
+    console.log('[Dashboard] Write failed:', e);
+  }
 }
 
 async function handlePrompt(userId: string, prompt: string, session: AppSession) {
@@ -1289,27 +1315,35 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
   cancelStatusClearTimer(userId);
   state.isProcessing = true;
   broadcastToUser(userId, 'state', { processing: true, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
-  try { await session.dashboard.write({ text: 'Thinking...' }); } catch {}
+
+  // Update dashboard: thinking
+  updateDashboard(session, 'Thinking...', truncate(prompt, 30), state.history.length);
   console.log(`[Prompt] "${prompt.substring(0, 60)}"`);
+
   try {
     let searchContext = '';
     const shouldSearch = WEB_SEARCH_ENABLED && state.genParams.webSearch && detectSearchIntent(prompt);
     if (shouldSearch) {
-      const searchPreview = truncate(prompt, 30);
-      try { await session.layouts.showDoubleTextWall('GeauxAI  searching...', searchPreview); } catch {}
+      const searchPreview = truncate(prompt, 45);
+      try { await session.layouts.showDoubleTextWall('Searching the web...', `"${searchPreview}"`); } catch {}
       broadcastToUser(userId, 'state', { processing: true, searching: true, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
-      try { await session.dashboard.write({ text: 'Searching web...' }); } catch {}
+      // Update dashboard: searching
+      updateDashboard(session, 'Searching...', truncate(prompt, 30), state.history.length);
       console.log(`[Search] Triggered for: "${prompt.substring(0, 60)}"`);
       searchContext = await webSearch(prompt);
     }
-    const thinkPreview = truncate(prompt, 30);
-    try { await session.layouts.showDoubleTextWall('GeauxAI  thinking...', thinkPreview); } catch {}
+
+    // Show thinking indicator (replaces search indicator if search ran)
+    const thinkPreview = truncate(prompt, 45);
+    try { await session.layouts.showDoubleTextWall('Thinking...', `"${thinkPreview}"`); } catch {}
+
     state.history.push({ role: 'user', content: prompt });
     // Trim history to prevent context overflow before sending to AI
     if (state.history.length > MAX_HISTORY_PAIRS * 2) {
       state.history = state.history.slice(-(MAX_HISTORY_PAIRS * 2));
     }
     const response = await callAI(state.history, state.genParams, searchContext);
+
     // Sanity check: detect runaway/looping response before display
     let safeResponse = response;
     if (response.length > MAX_RESPONSE_CHARS) {
@@ -1324,6 +1358,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
         safeResponse = response.slice(0, MAX_RESPONSE_CHARS);
       }
     }
+
     const clean = stripMarkdown(safeResponse);
     console.log(`[AI] "${clean.substring(0, 80)}"`);
     state.history.push({ role: 'assistant', content: clean });
@@ -1333,7 +1368,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     }
 
     // ── Release processing lock BEFORE showOnGlasses ─────────────────────
-    // showOnGlasses sleeps PAGE_DELAY (5s) between each glasses page.
+    // showOnGlasses sleeps PAGE_DELAY between each glasses page.
     // Keeping isProcessing=true during those sleeps holds the webview in
     // "Thinking..." mode and keeps fast-refreshing long after the AI has
     // actually finished. Release the lock now — the response is already in
@@ -1343,10 +1378,10 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     state.pendingRefresh = false;
     broadcastToUser(userId, 'state', { processing: false, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: true });
 
-    const modelUsed = (state.genParams.model.trim() || AI_MODEL);
-    const modelShort15 = modelUsed.split(':')[0].slice(0, 15);
-    try { await session.dashboard.write({ text: `✓ GeauxAI · ${modelShort15}` }); } catch {}
-    await showOnGlasses(session, clean, !!searchContext, userId);
+    // Apply display truncation at sentence boundary before showing on glasses
+    const displayText = truncateForDisplay(clean);
+    await showOnGlasses(session, displayText, userId, !!searchContext);
+
     // TTS — speak response if enabled for this user
     if (state.ttsEnabled) {
       if (state.ttsEngine === 'kokoro') {
@@ -1358,6 +1393,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
   } catch (err: any) {
     console.error(`[Error]`, err.message);
     try { await session.layouts.showDoubleTextWall('GeauxAI  error', truncate(err.message, 80)); } catch {}
+    updateDashboard(session, 'Error', truncate(err.message, 30));
     if (state.history.length && state.history[state.history.length - 1].role === 'user') state.history.pop();
     state.isProcessing  = false;
     state.pendingRefresh = false;
@@ -1428,67 +1464,112 @@ async function callAI(history: { role: string; content: string }[], params: GenP
   return ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
 }
 
+// ── Display: Zone 3 — AI Response ────────────────────────────────────────────
+// Shows paginated AI responses on the G1 glasses.
+// Strategy: showReferenceCard(title, text) → showTextWall fallback.
+// SDK uses separate string args — NOT an object: showReferenceCard(title: string, text: string, options?)
 async function showOnGlasses(
   session: AppSession,
   text: string,
-  fromSearch: boolean = false,
-  userId?: string
+  userId?: string,
+  fromSearch: boolean = false
 ) {
   if (!text?.trim()) return;
-  const pages = paginate(text);
+
+  // Paginate with 5 lines/page (full G1 display real estate)
+  const contentPages = paginate(text, 44, 5);
+  const total = contentPages.length;
+
+  // Store pages in user state for button navigation
   const userState = userId ? getState(userId) : null;
   if (userState) {
-    userState.pages     = pages;
+    userState.pages = contentPages;
     userState.pageIndex = 0;
   }
 
-  // showDoubleTextWall: native two-zone layout — label on top, content below.
-  // No manual dashes needed — the glasses render the two zones distinctly.
-  // showReferenceCard and showDashboardCard are banned — SDK bugs on G1.
-  for (let i = 0; i < pages.length; i++) {
-    const pageText = pages[i];
-    const total    = pages.length;
-    const isLast   = i === pages.length - 1;
-    const tag      = fromSearch ? 'GeauxAI  [web]' : 'GeauxAI';
-    const topText  = total > 1 ? `${tag}  ${i + 1}/${total}` : tag;
+  // ── Main paginated display loop ───────────────────────────────────────────
+  for (let i = 0; i < contentPages.length; i++) {
+    const pageNum  = i + 1;
+    const pageText = contentPages[i];
+    const isLast   = i === contentPages.length - 1;
+    const prefix   = fromSearch ? 'Search' : 'GeauxAI';
+    const titleText = total > 1 ? `${prefix} ${pageNum}/${total}` : prefix;
+
+    // Update page index in user state for button nav tracking
+    if (userState) userState.pageIndex = i;
+
+    // SDK signature: showReferenceCard(title: string, text: string, options?)
+    // Separate string args — NOT an object. The SDK internally builds { title, text }.
     try {
-      await session.layouts.showDoubleTextWall(topText, pageText);
-    } catch {
-      try { await session.layouts.showTextWall(pageText); } catch {}
+      await session.layouts.showReferenceCard(String(titleText), pageText);
+    } catch (err) {
+      console.log('[Display] showReferenceCard failed, falling back to showTextWall:', (err as Error).message);
+      const fallbackText = total > 1
+        ? `[${prefix} ${pageNum}/${total}]\n\n${pageText}`
+        : pageText;
+      try { await session.layouts.showTextWall(fallbackText); } catch { /* display completely failed */ }
     }
+
     if (!isLast) await sleep(PAGE_DELAY);
   }
 
-  // Start auto-clear timer after the final page is shown
+  // ── Post-display: auto-clear timer + dashboard update ─────────────────────
   if (userId) {
     const s = getState(userId);
-    if (s.ttsEnabled && s.ttsEngine === 'kokoro') { return; }
+    // If Kokoro TTS is active, speakWithKokoro handles its own auto-clear timer
+    if (s.ttsEnabled && s.ttsEngine === 'kokoro') {
+      updateDashboard(session, 'Ready', `Last: ${truncate(text, 25)}`, s.history.length);
+      return;
+    }
     cancelAutoClearTimer(userId);
     s.autoClearTimer = setTimeout(async () => {
       s.autoClearTimer = null;
       const activeSession = activeSessions.get(userId!);
       if (activeSession) {
         try { await activeSession.layouts.clearView(); } catch {}
-        const modelShort = AI_MODEL.split(':')[0].slice(0, 20);
-        try { await activeSession.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` }); } catch {}
         console.log(`[AutoClear] Display cleared for ${userId}`);
       }
     }, AUTO_CLEAR_DELAY_MS);
     console.log(`[AutoClear] Timer started for ${userId} (${AUTO_CLEAR_DELAY_MS}ms)`);
+    updateDashboard(session, 'Ready', `Last: ${truncate(text, 25)}`, s.history.length);
   }
 }
 
-function paginate(text: string, cpl = 34, lpp = 4): string[] {
-  const words = text.split(/\s+/);
+// ── Pagination ────────────────────────────────────────────────────────────────
+// Splits text into glasses-sized pages.
+// cpl=44: characters per line (G1 640px wide, SDK font fits ~40-46 chars)
+// lpp=5 : lines per page (G1 display fits 5 lines comfortably)
+// Handles words longer than line width without silent truncation.
+function paginate(text: string, cpl = 44, lpp = 5): string[] {
+  const words = text.split(/\s+/).filter(w => w.length > 0);
   const lines: string[] = [];
   let cur = '';
+
   for (const w of words) {
-    const c = cur ? `${cur} ${w}` : w;
-    if (c.length <= cpl) { cur = c; } else { if (cur) lines.push(cur); cur = w.substring(0, cpl); }
+    const candidate = cur ? `${cur} ${w}` : w;
+    if (candidate.length <= cpl) {
+      cur = candidate;
+    } else {
+      if (cur) lines.push(cur);
+      if (w.length > cpl) {
+        // Break long word across multiple lines
+        let remaining = w;
+        while (remaining.length > cpl) {
+          lines.push(remaining.substring(0, cpl));
+          remaining = remaining.substring(cpl);
+        }
+        cur = remaining;
+      } else {
+        cur = w;
+      }
+    }
   }
   if (cur) lines.push(cur);
+
   const pages: string[] = [];
-  for (let i = 0; i < lines.length; i += lpp) pages.push(lines.slice(i, i + lpp).join('\n'));
+  for (let i = 0; i < lines.length; i += lpp) {
+    pages.push(lines.slice(i, i + lpp).join('\n'));
+  }
   return pages.length ? pages : ['(empty)'];
 }
 
@@ -1502,11 +1583,33 @@ function truncate(t: string, max: number): string {
   return t.length <= max ? t : t.substring(0, max - 3) + '...';
 }
 
+// Truncate AI response at a natural sentence boundary for the glasses display.
+// Finds the last sentence-ending punctuation before MAX_DISPLAY_CHARS to avoid
+// cutting mid-sentence.
+function truncateForDisplay(text: string, max: number = MAX_DISPLAY_CHARS): string {
+  if (text.length <= max) return text;
+  const truncated = text.substring(0, max);
+  const lastPeriod   = truncated.lastIndexOf('.');
+  const lastQuestion = truncated.lastIndexOf('?');
+  const lastExclaim  = truncated.lastIndexOf('!');
+  const lastBreak    = Math.max(lastPeriod, lastQuestion, lastExclaim);
+  // Only use sentence boundary if it's in the second half of the truncation window
+  if (lastBreak > max * 0.5) {
+    return truncated.substring(0, lastBreak + 1);
+  }
+  return truncated.trim() + '...';
+}
+
 function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
 
 async function webSearch(query: string): Promise<string> {
   if (!TAVILY_API_KEY || !WEB_SEARCH_ENABLED) return '';
   try {
+    // Auto-detect topic: 'news' for current-events queries, 'general' for everything else
+    const newsSignals = /\b(news|headlines|today|breaking|war|election|president|trump|biden|congress|senate|politics|weather|stock|market|crisis|attack|bombing|killed|dead|earthquake|hurricane|tornado|flood|shooting|police|protest|iran|ukraine|russia|china|military|ceasefire|sanctions|tariff|inflation|economy|fed|rate|GDP)\b/i;
+    const searchTopic = newsSignals.test(query) ? 'news' : 'general';
+    console.log(`[Search] Topic: ${searchTopic} for: "${query.substring(0, 60)}"`);
+
     const r = await fetch('https://api.tavily.com/search', {
       method: 'POST',
       headers: {
@@ -1515,11 +1618,11 @@ async function webSearch(query: string): Promise<string> {
       },
       body: JSON.stringify({
         query,
-        search_depth:        'basic',
-        include_answer:       true,
-        include_raw_content:  false,
-        max_results:          5,
-        topic:               'general',
+        search_depth:        'advanced',  // deeper crawl, 2 credits/search
+        include_answer:       true,        // Tavily AI-generated summary
+        include_raw_content:  false,       // keep false to control context size
+        max_results:          8,           // more sources
+        topic:               searchTopic, // auto-detected: 'news' or 'general'
       }),
     });
     if (!r.ok) { console.log(`[WebSearch] Tavily error: HTTP ${r.status}`); return ''; }
@@ -1537,19 +1640,23 @@ async function webSearch(query: string): Promise<string> {
       lines.push('');
     }
 
-    const results = (data.results || []).slice(0, 4);
+    const results = (data.results || []).slice(0, 6);
     results.forEach((res: any, i: number) => {
-      const title   = (res.title   || '').trim();
-      const content = (res.content || '').trim().substring(0, 200);
+      const title   = (res.title            || '').trim();
+      const content = (res.content          || '').trim().substring(0, 500);
+      const url     = (res.url              || '').trim();
+      const pubDate = (res.published_date   || '').trim();
       if (title || content) {
         lines.push(`${i + 1}. ${title}`);
+        if (pubDate) lines.push(`   Published: ${pubDate}`);
+        if (url)     lines.push(`   Source: ${url}`);
         if (content) lines.push(`   ${content}`);
         lines.push('');
       }
     });
 
     lines.push('===END SEARCH RESULTS===');
-    lines.push(`Use these results to answer. Today's date is ${now}.`);
+    lines.push(`Use these results to answer comprehensively. Today's date is ${now}. Cite sources when possible.`);
 
     const count = results.length;
     if (count === 0 && !data.answer) {
@@ -1567,7 +1674,7 @@ async function webSearch(query: string): Promise<string> {
 async function speakWithElevenLabs(session: AppSession, text: string): Promise<void> {
   if (!ELEVENLABS_API_KEY) return;
   try {
-    const safeText = text.length > 2500 ? text.slice(0, 2497) + '...' : text;
+    const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
     const result = await session.audio.speak(safeText, {
       voice_id: ELEVENLABS_VOICE_ID,
       model_id: 'eleven_flash_v2_5',
@@ -1588,7 +1695,7 @@ async function speakWithElevenLabs(session: AppSession, text: string): Promise<v
 
 async function speakWithKokoro(userId: string, text: string): Promise<void> {
   try {
-    const safeText = text.length > 2500 ? text.slice(0, 2497) + '...' : text;
+    const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
     const r = await fetch(`${KOKORO_HOST}/v1/audio/speech`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1617,8 +1724,7 @@ async function speakWithKokoro(userId: string, text: string): Promise<void> {
       const kSession = activeSessions.get(userId);
       if (kSession) {
         try { await kSession.layouts.clearView(); } catch {}
-        const modelShort = AI_MODEL.split(':')[0].slice(0, 20);
-        try { await kSession.dashboard.write({ text: `🎤 GeauxAI · ${modelShort}` }); } catch {}
+        updateDashboard(kSession, 'Ready');
         console.log(`[AutoClear] Display cleared for ${userId}`);
       }
     }, AUTO_CLEAR_DELAY_MS);
