@@ -1,4 +1,7 @@
 import { AppServer, AppSession } from '@mentra/sdk';
+import multer from 'multer';
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT         = parseInt(process.env.PORT || '3000');
@@ -17,10 +20,12 @@ const OWNER_EMAIL  = process.env.OWNER_EMAIL || '';
 const WEB_SEARCH_ENABLED = process.env.WEB_SEARCH_ENABLED !== 'false';
 const TAVILY_API_KEY     = process.env.TAVILY_API_KEY     || '';
 const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY  || '';
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'ZzBpNW0j7Iq2XRx6Xo49';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '';
 const KOKORO_HOST   = process.env.KOKORO_HOST   || 'http://localhost:8880';
-const KOKORO_VOICE  = process.env.KOKORO_VOICE  || 'am_eric';
+const KOKORO_VOICE  = process.env.KOKORO_VOICE  || '';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://app.geauxailabs.com';
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
+const CF_API_TOKEN  = process.env.CF_API_TOKEN  || '';
 const MAX_HISTORY_PAIRS  = 10;   // keep last 10 user+assistant pairs (20 messages)
 const MAX_RESPONSE_CHARS = 8000; // cap runaway model output before display
 const MAX_DISPLAY_CHARS  = 8000; // pagination handles length — no artificial cut
@@ -35,6 +40,7 @@ interface GenParams {
   maxTokens:    number;
   model:        string;  // empty string = use AI_MODEL from .env (server default)
   webSearch:    boolean;
+  useCloudflare: boolean;
 }
 
 interface UserState {
@@ -54,6 +60,7 @@ interface UserState {
   isListening:    boolean;
   ttsEnabled:     boolean;
   ttsEngine:      'elevenlabs' | 'kokoro';
+  lastPrompt:     string;   // last user question shown on glasses (Q&A header)
 }
 const userStates          = new Map<string, UserState>();
 const activeSessions      = new Map<string, AppSession>();
@@ -74,7 +81,37 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   maxTokens:    2048,
   model:        '',
   webSearch:    true,
+  useCloudflare: false,
 };
+
+const CF_MODELS: string[] = [
+  '@cf/nvidia/nemotron-3-120b-a12b',
+'@cf/zai-org/glm-4.7-flash',
+'@cf/ibm-granite/granite-4.0-h-micro',
+'@cf/aisingapore/gemma-sea-lion-v4-27b-it',
+'@cf/openai/gpt-oss-20b',
+'@cf/qwen/qwen3-30b-a3b-fp8',
+'@cf/meta/llama-4-scout-17b-16e-instruct',
+'@cf/google/gemma-3-12b-it',
+'@cf/mistralai/mistral-small-3.1-24b-instruct',
+'@cf/qwen/qwq-32b',
+'@cf/qwen/qwen2.5-coder-32b-instruct',
+'@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
+'@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+'@cf/meta/llama-3.2-1b-instruct',
+'@cf/meta/llama-3.2-3b-instruct',
+'@cf/meta/llama-3.1-8b-instruct-awq',
+'@cf/meta/llama-3.1-8b-instruct-fp8',
+'@cf/meta/llama-3-8b-instruct-awq',
+'@cf/meta/llama-3-8b-instruct',
+'@hf/mistral/mistral-7b-instruct-v0.2',
+'@cf/google/gemma-7b-it-lora',
+'@cf/google/gemma-2b-it-lora',
+'@cf/meta-llama/llama-2-7b-chat-hf-lora',
+'@hf/google/gemma-7b-it',
+'@hf/nousresearch/hermes-2-pro-mistral-7b',
+'@cf/mistral/mistral-7b-instruct-v0.2-lora',
+];
 
 function getState(userId: string): UserState {
   if (!userStates.has(userId)) {
@@ -83,7 +120,7 @@ function getState(userId: string): UserState {
       micMuted: false, pendingRefresh: false,
       pages: [], pageIndex: 0, autoClearTimer: null, statusClearTimer: null,
       genParams: { ...DEFAULT_GEN_PARAMS }, sseClients: [], deviceState: null,
-      isListening: false, ttsEnabled: false, ttsEngine: 'kokoro',
+      isListening: false, ttsEnabled: false, ttsEngine: 'kokoro', lastPrompt: '',
     });
   }
   return userStates.get(userId)!;
@@ -118,7 +155,7 @@ function broadcastToUser(userId: string, event: string, data: object) {
 
 async function showStatusOnGlasses(session: AppSession, userId: string, msg: string) {
   cancelStatusClearTimer(userId);
-  try { await session.layouts.showDoubleTextWall('GeauxAI', msg); } catch {}
+  try { await session.layouts.showTextWall('GeauxAI\n' + msg); } catch {}
   const s = getState(userId);
   s.statusClearTimer = setTimeout(async () => {
     s.statusClearTimer = null;
@@ -169,9 +206,27 @@ function buildPage(
   } else {
     for (const msg of history) {
       const u = msg.role === 'user';
+      let displayContent = msg.content;
+      let attachLabel = '';
+      if (u) {
+        if (msg.content.startsWith('[Image] ')) {
+          attachLabel = '<span style="font-size:10px;color:var(--v3);font-family:var(--mono);margin-bottom:3px;display:block">📎 IMAGE</span>';
+          displayContent = msg.content.slice(8);
+        } else if (msg.content.startsWith('[Audio transcript]:')) {
+          const lines = msg.content.split('\n\n');
+          const userText = lines.slice(1).join('\n\n');
+          const transcript = lines[0].replace('[Audio transcript]: ', '');
+          attachLabel = '<span style="font-size:10px;color:var(--c2);font-family:var(--mono);margin-bottom:3px;display:block">🎤 AUDIO</span>';
+          displayContent = (userText || transcript).slice(0, 200);
+        } else if (msg.content.startsWith('[Document content]:')) {
+          attachLabel = '<span style="font-size:10px;color:var(--g2);font-family:var(--mono);margin-bottom:3px;display:block">📄 DOC</span>';
+          displayContent = msg.content.split('\n\n').slice(1).join('\n\n') || '[document]';
+          displayContent = displayContent.slice(0, 200);
+        }
+      }
       bubbles += `<div class="msg ${u ? 'msg-u' : 'msg-a'}">
         <div class="msg-role">${u ? 'YOU' : 'AI'}</div>
-        <div class="msg-body">${esc(msg.content)}</div>
+        <div class="msg-body">${attachLabel}${esc(displayContent)}</div>
       </div>`;
     }
     if (processing) {
@@ -424,6 +479,27 @@ kbd{
 }
 .ft-go:active{transform:scale(.9);opacity:.8}
 .ft-go:disabled{opacity:.28;cursor:not-allowed}
+/* Attach button */
+.ft-attach{
+  flex-shrink:0;width:38px;height:38px;
+  background:var(--bg3);border:1px solid var(--edge2);border-radius:10px;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;
+  font-size:17px;color:var(--tx3);
+  transition:border-color .15s,color .15s;-webkit-appearance:none;
+}
+.ft-attach:hover{border-color:var(--v2);color:var(--v3)}
+.ft-attach.has-file{border-color:var(--v2);color:var(--v3);background:#1a0e38}
+/* File preview chip above the footer */
+.ft-preview{
+  display:none;align-items:center;gap:8px;
+  padding:6px 14px;background:var(--glass);border-top:1px solid var(--edge);
+  font-family:var(--mono);font-size:10px;color:var(--tx2);
+}
+.ft-preview.visible{display:flex}
+.ft-prev-img{width:36px;height:36px;border-radius:6px;object-fit:cover;border:1px solid var(--edge2)}
+.ft-prev-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.ft-prev-rm{background:none;border:none;cursor:pointer;color:var(--tx3);font-size:14px;padding:2px 4px;}
+.ft-prev-rm:hover{color:var(--r)}
 </style>
 
 <script>
@@ -608,6 +684,13 @@ kbd{
       <select class="p-sel" id="p-model"><option value="">Default (${AI_MODEL})</option></select>
     </div>
     <div class="p-row">
+      <span class="p-lbl">AI PROVIDER <span class="p-hint">— switch between local Ollama and Cloudflare cloud AI</span></span>
+      <div class="p-tog-row">
+        <label class="tsw"><input type="checkbox" id="p-cf"><span class="ttrack"></span></label>
+        <span class="thint" id="p-cf-hint">OLLAMA — local models</span>
+      </div>
+    </div>
+    <div class="p-row">
       <span class="p-lbl">WEB SEARCH <span class="p-hint">— inject live results for current events &amp; facts</span></span>
       <div class="p-tog-row">
         <label class="tsw"><input type="checkbox" id="p-ws"><span class="ttrack"></span></label>
@@ -635,7 +718,14 @@ kbd{
 
 <div class="feed" id="feed">${bubbles}</div>
 
+<div class="ft-preview" id="ft-preview">
+  <img class="ft-prev-img" id="ft-prev-img" src="" alt="" style="display:none">
+  <span class="ft-prev-name" id="ft-prev-name"></span>
+  <button class="ft-prev-rm" id="ft-prev-rm" title="Remove file">✕</button>
+</div>
 <footer class="ft">
+  <input type="file" id="ft-file" accept="image/*,audio/*,.pdf,.txt" style="display:none">
+  <button class="ft-attach" id="ft-attach" title="Attach image, audio, or document">📎</button>
   <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="10000" rows="1"></textarea>
   <button class="ft-go" id="ft-go" title="Send">↑</button>
 </footer>
@@ -665,28 +755,39 @@ kbd{
     var mt=document.getElementById('p-maxtok');
     var mdl=document.getElementById('p-model');
     var ws=document.getElementById('p-ws');
+    var cf=document.getElementById('p-cf');
     if(!sys||!temp||!topp||!mt) return;
     fetch('/api/params'+authQ,{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         systemPrompt:sys.value,temperature:parseFloat(temp.value),
         topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
-        model:mdl?mdl.value:'',webSearch:ws?ws.checked:true
+        model:mdl?mdl.value:'',webSearch:ws?ws.checked:true,
+        useCloudflare:cf?cf.checked:false
       })
     }).catch(function(){});
   }
   var dSend=deb(sendParams,600);
 
   var pendingMdl='';
-  fetch('/api/models')
-    .then(function(r){return r.ok?r.json():null;})
-    .then(function(d){
-      if(!d||!d.models) return;
-      var sel=document.getElementById('p-model');
-      if(!sel) return;
-      d.models.forEach(function(m){var o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);});
-      if(pendingMdl) sel.value=pendingMdl;
-    }).catch(function(){});
+  function refreshModels(provider){
+    var url='/api/models'+(provider==='cloudflare'?'?provider=cloudflare':'');
+    fetch(url)
+      .then(function(r){return r.ok?r.json():null;})
+      .then(function(d){
+        if(!d||!d.models) return;
+        var sel=document.getElementById('p-model');
+        if(!sel) return;
+        // Clear existing options except the first (default)
+        while(sel.options.length>1) sel.remove(1);
+        // Update default option text
+        sel.options[0].textContent='Default ('+d.default+')';
+        d.models.forEach(function(m){var o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);});
+        if(pendingMdl) sel.value=pendingMdl;
+      }).catch(function(){});
+  }
+  // Initial load
+  refreshModels('ollama');
 
   fetch('/api/params'+authQ)
     .then(function(r){return r.ok?r.json():null;})
@@ -710,6 +811,14 @@ kbd{
         ws.checked=!!d.webSearch;
         if(wsh) wsh.textContent=d.webSearch?'🔍 ON — live web results injected':'OFF — model knowledge only';
       }
+      var cf=document.getElementById('p-cf');
+      var cfh=document.getElementById('p-cf-hint');
+      if(cf&&d.useCloudflare!==undefined){
+        cf.checked=!!d.useCloudflare;
+        if(cfh) cfh.textContent=d.useCloudflare?'☁ CLOUDFLARE — cloud AI models':'OLLAMA — local models';
+        // Refresh model list for the right provider
+        refreshModels(d.useCloudflare?'cloudflare':'ollama');
+      }
     }).catch(function(){});
 
   var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
@@ -729,6 +838,19 @@ kbd{
     var on=wsEl.checked;
     if(wshEl) wshEl.textContent=on?'🔍 ON — live web results injected':'OFF — model knowledge only';
     fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webSearch:on})}).catch(function(){});
+  });
+  var cfEl=document.getElementById('p-cf'),cfhEl=document.getElementById('p-cf-hint');
+  if(cfEl) cfEl.addEventListener('change',function(){
+    var on=cfEl.checked;
+    if(cfhEl) cfhEl.textContent=on?'☁ CLOUDFLARE — cloud AI models':'OLLAMA — local models';
+    // Clear selected model when switching providers
+    var mdlSel=document.getElementById('p-model');
+    if(mdlSel) mdlSel.value='';
+    pendingMdl='';
+    // Refresh model dropdown for the new provider
+    refreshModels(on?'cloudflare':'ollama');
+    // Save immediately
+    fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({useCloudflare:on,model:''})}).catch(function(){});
   });
   var mtEl=document.getElementById('p-maxtok');
   if(mtEl){mtEl.addEventListener('change',sendParams);mtEl.addEventListener('blur',sendParams);}
@@ -760,24 +882,97 @@ kbd{
 
   // AJAX send (no page reload)
   var btn=document.getElementById('ft-go');
+
+  var attachedFile = null; // holds the File object if user picked one
+
+  // Attach button click — open file picker
+  var attachBtn = document.getElementById('ft-attach');
+  var fileInput = document.getElementById('ft-file');
+  var preview   = document.getElementById('ft-preview');
+  var prevImg   = document.getElementById('ft-prev-img');
+  var prevName  = document.getElementById('ft-prev-name');
+  var prevRm    = document.getElementById('ft-prev-rm');
+
+  if(attachBtn && fileInput) {
+    attachBtn.addEventListener('click', function(){ fileInput.click(); });
+    fileInput.addEventListener('change', function(){
+      var f = fileInput.files && fileInput.files[0];
+      if(!f) return;
+      attachedFile = f;
+      attachBtn.classList.add('has-file');
+      if(preview) preview.classList.add('visible');
+      if(prevName) prevName.textContent = f.name + ' (' + (f.size > 1024*1024 ? (f.size/1024/1024).toFixed(1)+'MB' : (f.size/1024).toFixed(0)+'KB') + ')';
+      // Show image preview if it's an image
+      if(prevImg){
+        if(f.type.startsWith('image/')){
+          var reader = new FileReader();
+          reader.onload = function(ev){ prevImg.src = ev.target.result; prevImg.style.display='block'; };
+          reader.readAsDataURL(f);
+        } else {
+          prevImg.style.display = 'none';
+          prevImg.src = '';
+        }
+      }
+      // Clear the input so the same file can be re-selected
+      fileInput.value = '';
+    });
+  }
+
+  if(prevRm) {
+    prevRm.addEventListener('click', function(){
+      attachedFile = null;
+      if(attachBtn) attachBtn.classList.remove('has-file');
+      if(preview) preview.classList.remove('visible');
+      if(prevImg){ prevImg.src=''; prevImg.style.display='none'; }
+      if(prevName) prevName.textContent = '';
+    });
+  }
+
   function doSend(){
     (function(){ var p=document.getElementById('_kplayer'); if(!p){p=document.createElement('audio');p.id='_kplayer';p.autoplay=true;document.body.appendChild(p);} p.pause(); p.src=''; p.muted=true; var s=p.play(); if(s) s.then(function(){p.muted=false;}).catch(function(){}); })();
-    var text=inp?inp.value.trim():'';
-    if(!text) return;
-    btn.disabled=true;
-    fetch('/prompt'+authQ,{
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'text='+encodeURIComponent(text)
-    }).then(function(){
-      if(inp){inp.value='';inp.style.height='auto';}
-      btn.disabled=false;
-      // If a reload was deferred while user was typing, fire it now that input is clear
+    var text = inp ? inp.value.trim() : '';
+    // Require either text OR a file (or both)
+    if(!text && !attachedFile) return;
+    btn.disabled = true;
+
+    var onDone = function(){
+      if(inp){ inp.value=''; inp.style.height='auto'; }
+      // Clear attachment
+      attachedFile = null;
+      if(attachBtn) attachBtn.classList.remove('has-file');
+      if(preview) preview.classList.remove('visible');
+      if(prevImg){ prevImg.src=''; prevImg.style.display='none'; }
+      if(prevName) prevName.textContent='';
+      btn.disabled = false;
       if(inp && inp.dataset.pendingReload){
         delete inp.dataset.pendingReload;
         window.location.reload();
       }
-    }).catch(function(){btn.disabled=false;});
+    };
+
+    if(attachedFile){
+      // File attached — send as multipart to /upload
+      var fd = new FormData();
+      fd.append('text', text || '');
+      fd.append('file', attachedFile, attachedFile.name);
+      fetch('/upload'+authQ, { method:'POST', body:fd })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if(d.error){
+            // Show error inline in the chat (server error, e.g. wrong model)
+            alert('⚠️ ' + d.error);
+          }
+          onDone();
+        })
+        .catch(function(){ btn.disabled=false; });
+    } else {
+      // No file — send text only to /prompt as before (unchanged behavior)
+      fetch('/prompt'+authQ, {
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'text='+encodeURIComponent(text)
+      }).then(onDone).catch(function(){ btn.disabled=false; });
+    }
   }
   if(btn) btn.addEventListener('click',doSend);
   if(inp) inp.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend();}});
@@ -834,8 +1029,17 @@ class GeauxAIApp extends AppServer {
 
     activeSessions.set(userId, session);
 
+    // Restore persisted preferences (TTS, mic, genParams) from previous session
+    await loadUserPrefs(session, userId);
+
     // Initialize dashboard — show Ready state with model info
     updateDashboard(session, 'Ready', undefined, getState(userId).history.length);
+    // Expanded dashboard: shown when user looks up — static usage hint
+    try {
+      await (session.dashboard.content as any).writeToExpanded(
+        'GeauxAiPrompt v2\nSay "Go AI" + your question\nOr type on phone'
+      );
+    } catch {}
 
     // ── Suppress known harmless SDK noise ─────────────────────────────────────
     // The G1 glasses send "device_state_update" messages that the current SDK
@@ -854,9 +1058,7 @@ class GeauxAIApp extends AppServer {
       };
     }
 
-    try { await session.layouts.showDoubleTextWall('GeauxAI  ready', 'Say "Go AI" then speak\nChat log on your phone'); } catch {
-      try { await session.layouts.showTextWall('GeauxAI ready'); } catch {}
-    }
+    try { await session.layouts.showTextWall('GeauxAI ready\n\nSay "Go AI" then speak\nChat log on your phone'); } catch {}
 
     // ── Button handler ────────────────────────────────────────────────────────
     // G1 has two TouchBars (left temple / right temple).
@@ -928,18 +1130,18 @@ class GeauxAIApp extends AppServer {
 
         if (newIndex === s.pageIndex && isLeft  && s.pageIndex === 0) {
           console.log(`[Button] Already at first page`);
-          try { await session.layouts.showDoubleTextWall(`GeauxAI  1/${s.pages.length}`, s.pages[0]); } catch {}
+          try { await session.layouts.showTextWall(`[1/${s.pages.length}]\n${s.pages[0]}`); } catch {}
           return;
         }
         if (newIndex === s.pageIndex && !isLeft && s.pageIndex === s.pages.length - 1) {
           console.log(`[Button] Already at last page`);
-          try { await session.layouts.showDoubleTextWall(`GeauxAI  ${s.pages.length}/${s.pages.length}`, s.pages[s.pageIndex]); } catch {}
+          try { await session.layouts.showTextWall(`[${s.pages.length}/${s.pages.length}]\n${s.pages[s.pageIndex]}`); } catch {}
           return;
         }
 
         s.pageIndex = newIndex;
         console.log(`[Button] ${isLeft ? 'LEFT←prev' : 'RIGHT→next'} → page ${s.pageIndex + 1}/${s.pages.length}`);
-        try { await session.layouts.showDoubleTextWall(`GeauxAI  ${s.pageIndex + 1}/${s.pages.length}`, s.pages[s.pageIndex]); } catch {}
+        try { await session.layouts.showTextWall(`[${s.pageIndex + 1}/${s.pages.length}]\n${s.pages[s.pageIndex]}`); } catch {}
       }
     });
 
@@ -969,6 +1171,8 @@ class GeauxAIApp extends AppServer {
       await handlePrompt(userId, stripped, session);
     });
 
+    console.log('[Events] transcription, button_press registered');
+
     // Device state polling — SDK does not expose onDeviceStateChange; instead
     // we poll session.device every 30 s and broadcast when values change.
     const devicePollInterval = setInterval(() => {
@@ -991,6 +1195,49 @@ class GeauxAIApp extends AppServer {
       } catch {}
     }, 30000);
     devicePollIntervals.set(userId, devicePollInterval);
+  }
+
+  // ── Mira AI Tool Integration ───────────────────────────────────────────────
+  // Tools registered in MentraOS Developer Console (console.mentra.glass):
+  //   ask_geauxai : { question: string } — Ask GeauxAI a question via Mira
+  //   web_search  : { query:    string } — Search the web via Tavily
+  // Tool calls arrive outside active sessions; they use this server-level hook.
+  protected async onToolCall(toolCall: any): Promise<string | undefined> {
+    console.log(`[ToolCall] ${toolCall.toolId} from ${toolCall.userId}`);
+    try {
+      if (toolCall.toolId === 'ask_geauxai') {
+        const question = toolCall.toolParameters?.question as string;
+        if (!question) return 'Please provide a question.';
+
+        // One-shot AI call — no conversation history for tool calls
+        const userHistory = [{ role: 'user', content: question }];
+        const params      = getState(toolCall.userId).genParams;
+        const response    = await callAI(userHistory, params);
+        const clean       = stripMarkdown(response);
+        console.log(`[ToolCall] Response: "${clean.substring(0, 80)}"`);
+
+        // If user has an active glasses session, also display the answer there
+        const activeSession = activeSessions.get(toolCall.userId);
+        if (activeSession) {
+          const s = getState(toolCall.userId);
+          s.lastPrompt = truncate(question, 40);
+          await showOnGlasses(activeSession, clean, toolCall.userId);
+        }
+        return clean;
+      }
+
+      if (toolCall.toolId === 'web_search') {
+        const query = toolCall.toolParameters?.query as string;
+        if (!query) return 'Please provide a search query.';
+        const results = await webSearch(query);
+        return results || 'No results found.';
+      }
+
+      return undefined; // Unknown tool — let MentraOS handle it
+    } catch (err: any) {
+      console.error(`[ToolCall] Error: ${err.message}`);
+      return `Error: ${err.message}`;
+    }
   }
 
   protected async onStop(sessionId: string, userId: string, reason: string) {
@@ -1023,7 +1270,7 @@ class GeauxAIApp extends AppServer {
     // Required: parse urlencoded form bodies (textarea POST sends text=... urlencoded)
     // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add both here.
     app.use(require('express').urlencoded({ extended: false, limit: '1mb' }));
-    app.use(require('express').json({ limit: '1mb' }));
+    app.use(require('express').json({ limit: '25mb' }));
 
     // ── Per-request user resolver ─────────────────────────────────────────────
     // The SDK auth middleware sets req.authUserId from the signed token on every
@@ -1097,6 +1344,7 @@ class GeauxAIApp extends AppServer {
         updateDashboard(session, s.micMuted ? 'Mic Off' : 'Listening');
         const msg = s.micMuted ? 'Microphone muted.\nTap MIC ON in the app to resume.' : 'Microphone active.\nSpeak into your glasses.';
         await showStatusOnGlasses(session, userId, msg);
+        saveUserPrefs(session, userId).catch(() => {});
       }
       res.redirect(303, '/webview');
     });
@@ -1111,6 +1359,8 @@ class GeauxAIApp extends AppServer {
         micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
         connected: activeSessions.has(userId), reload: false,
       });
+      const activeSession = activeSessions.get(userId);
+      if (activeSession) saveUserPrefs(activeSession, userId).catch(() => {});
       res.json({ ok: true, ttsEnabled: s.ttsEnabled });
     });
 
@@ -1124,6 +1374,8 @@ class GeauxAIApp extends AppServer {
         micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
         connected: activeSessions.has(userId), reload: false,
       });
+      const activeSession = activeSessions.get(userId);
+      if (activeSession) saveUserPrefs(activeSession, userId).catch(() => {});
       res.json({ ok: true, ttsEngine: s.ttsEngine });
     });
 
@@ -1156,6 +1408,103 @@ class GeauxAIApp extends AppServer {
       getState(userId).pendingRefresh = true;
       handlePrompt(userId, text, session);     // fire-and-forget
       res.redirect(303, '/webview');
+    });
+
+    // ── File/Image/Audio upload route ─────────────────────────────────────────
+    app.post('/upload', upload.single('file'), async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const session = activeSessions.get(userId);
+      if (!session) {
+        return res.status(400).json({ error: 'No active glasses session.' });
+      }
+
+      const text = (req.body?.text || '').trim();
+      const file = req.file; // multer puts the file here
+
+      // Rate limit check (same logic as /prompt)
+      const now = Date.now();
+      const rl = rateLimits.get(userId) ?? { count: 0, resetTime: now + RATE_LIMIT_WINDOW_MS };
+      if (now > rl.resetTime) { rl.count = 0; rl.resetTime = now + RATE_LIMIT_WINDOW_MS; }
+      if (rl.count >= RATE_LIMIT_MAX_REQUESTS) {
+        rateLimits.set(userId, rl);
+        return res.status(429).json({ error: 'Rate limit exceeded. Try again in 60s.' });
+      }
+      rl.count++;
+      rateLimits.set(userId, rl);
+
+      const s = getState(userId);
+      if (s.isProcessing) {
+        return res.status(429).json({ error: 'Already processing a prompt. Please wait.' });
+      }
+
+      // If no file, fall through to normal text prompt
+      if (!file) {
+        if (!text) return res.status(400).json({ error: 'No text or file provided.' });
+        handlePrompt(userId, text, session);
+        return res.json({ ok: true });
+      }
+
+      // Determine file category
+      const mime = file.mimetype || '';
+      const filename = file.originalname || 'file';
+      const isImage = mime.startsWith('image/');
+      const isAudio = mime.startsWith('audio/') || /\.(mp3|wav|m4a|ogg|webm)$/i.test(filename);
+      const isDoc   = mime === 'application/pdf' || mime === 'text/plain' || /\.(pdf|txt)$/i.test(filename);
+
+      console.log(`[Upload] ${userId} file="${filename}" mime="${mime}" size=${file.size}`);
+
+      try {
+        if (isImage) {
+          const base64 = file.buffer.toString('base64');
+          const mediaType = mime || 'image/jpeg';
+          const promptText = text || 'Describe this image in detail.';
+          await handleImagePrompt(userId, promptText, base64, mediaType, session);
+          return res.json({ ok: true });
+        }
+
+        if (isAudio) {
+          if (AI_PROVIDER !== 'openai' || !OPENAI_KEY) {
+            return res.status(400).json({ error: 'Audio transcription requires OpenAI provider with OPENAI_API_KEY set.' });
+          }
+          const transcript = await transcribeAudio(file.buffer, filename, mime);
+          if (!transcript) {
+            return res.status(500).json({ error: 'Audio transcription failed.' });
+          }
+          const combined = text
+            ? `[Audio transcript]: ${transcript}\n\n${text}`
+            : `[Audio transcript]: ${transcript}`;
+          handlePrompt(userId, combined, session);
+          return res.json({ ok: true, transcript });
+        }
+
+        if (isDoc) {
+          let docText = '';
+          if (mime === 'text/plain' || /\.txt$/i.test(filename)) {
+            docText = file.buffer.toString('utf-8');
+          } else {
+            try {
+              const pdfParse = require('pdf-parse');
+              const pdfData = await pdfParse(file.buffer);
+              docText = pdfData.text || '';
+            } catch (err: any) {
+              console.log(`[Upload] PDF parse failed: ${err.message}`);
+              return res.status(500).json({ error: 'Could not extract text from PDF.' });
+            }
+          }
+          docText = docText.slice(0, 8000); // cap context
+          const combined = text
+            ? `[Document content]:\n${docText}\n\n${text}`
+            : `[Document content]:\n${docText}\n\nPlease summarize and analyze this document.`;
+          handlePrompt(userId, combined, session);
+          return res.json({ ok: true });
+        }
+
+        return res.status(400).json({ error: `Unsupported file type: ${mime}` });
+
+      } catch (err: any) {
+        console.error(`[Upload] Error: ${err.message}`);
+        return res.status(500).json({ error: err.message });
+      }
     });
 
     // ── SSE real-time push ────────────────────────────────────────────────────
@@ -1222,21 +1571,32 @@ class GeauxAIApp extends AppServer {
       if (typeof b.topP === 'number')
         s.genParams.topP         = Math.min(1, Math.max(0, b.topP));
       if (typeof b.maxTokens === 'number')
-        s.genParams.maxTokens    = Math.min(8192, Math.max(256, Math.round(b.maxTokens)));
+        s.genParams.maxTokens    = Math.min(32000, Math.max(256, Math.round(b.maxTokens)));
       if (typeof b.model === 'string')
         s.genParams.model        = b.model.slice(0, 200);
       if (typeof b.webSearch === 'boolean')
         s.genParams.webSearch    = b.webSearch;
-      console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
+      if (typeof b.useCloudflare === 'boolean')
+        s.genParams.useCloudflare = b.useCloudflare;
+      console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
       const sess = activeSessions.get(userId);
-      if (sess) updateDashboard(sess, 'Ready', undefined, s.history.length);
+      if (sess) {
+        updateDashboard(sess, 'Ready', undefined, s.history.length);
+        saveUserPrefs(sess, userId).catch(() => {});
+      }
       res.json({ ok: true });
     });
 
     // ── Models API ────────────────────────────────────────────────────────────
     // GET /api/models — no auth required; read-only metadata
     // Returns locally available Ollama model names + the server default model.
-    app.get('/api/models', async (_req: any, res: any) => {
+    // Pass ?provider=cloudflare to get the Cloudflare model catalog instead.
+    app.get('/api/models', async (req: any, res: any) => {
+      const provider = req.query?.provider;
+      if (provider === 'cloudflare') {
+        return res.json({ models: CF_MODELS, default: CF_MODELS[0] });
+      }
+      // Default: Ollama local models
       try {
         const r = await fetch(`${OLLAMA_HOST}/api/tags`);
         if (!r.ok) throw new Error(`Ollama tags error ${r.status}`);
@@ -1263,7 +1623,7 @@ class GeauxAIApp extends AppServer {
     app.get('/webview', serve);
     app.get('/health', (_req: any, res: any) => res.json({ status: 'healthy' }));
 
-    console.log('[Routes] / /webview /health /clear /mic /prompt /api/params /api/models /api/stream /tts-audio/:id registered');
+    console.log('[Routes] / /webview /health /clear /mic /prompt /upload /api/params /api/models /api/stream /tts-audio/:id registered');
   }
 }
 
@@ -1299,9 +1659,50 @@ function updateDashboard(
   } catch (e) {
     // Dashboard content API not available on this firmware — fall back silently
     try {
-      (session.dashboard as any).write({ text: `GeauxAI | ${status}` });
+      (session.dashboard.content as any).writeToMain(`GeauxAI | ${status}`);
     } catch { /* non-critical, continue */ }
     console.log('[Dashboard] Write failed:', e);
+  }
+}
+
+// ── SimpleStorage: persist user preferences across server restarts ────────────
+
+async function saveUserPrefs(session: AppSession, userId: string): Promise<void> {
+  try {
+    const s = getState(userId);
+    const prefs = {
+      ttsEnabled: s.ttsEnabled,
+      ttsEngine:  s.ttsEngine,
+      micMuted:   s.micMuted,
+      genParams:  s.genParams,
+    };
+    await (session as any).simpleStorage.set('userPrefs', JSON.stringify(prefs));
+    console.log(`[Storage] Saved prefs for ${userId}`);
+  } catch (err: any) {
+    console.log(`[Storage] Save failed: ${err.message}`);
+  }
+}
+
+async function loadUserPrefs(session: AppSession, userId: string): Promise<void> {
+  try {
+    const raw = await (session as any).simpleStorage.get('userPrefs');
+    if (!raw) return;
+    const prefs = JSON.parse(raw);
+    const s = getState(userId);
+    if (typeof prefs.ttsEnabled === 'boolean')                         s.ttsEnabled = prefs.ttsEnabled;
+    if (prefs.ttsEngine === 'kokoro' || prefs.ttsEngine === 'elevenlabs') s.ttsEngine = prefs.ttsEngine;
+    if (typeof prefs.micMuted   === 'boolean')                         s.micMuted   = prefs.micMuted;
+    if (prefs.genParams) {
+      if (prefs.genParams.systemPrompt)                    s.genParams.systemPrompt = prefs.genParams.systemPrompt;
+      if (typeof prefs.genParams.temperature === 'number') s.genParams.temperature  = prefs.genParams.temperature;
+      if (typeof prefs.genParams.topP        === 'number') s.genParams.topP         = prefs.genParams.topP;
+      if (typeof prefs.genParams.maxTokens   === 'number') s.genParams.maxTokens    = prefs.genParams.maxTokens;
+      if (prefs.genParams.model)                           s.genParams.model        = prefs.genParams.model;
+      if (typeof prefs.genParams.useCloudflare === 'boolean') s.genParams.useCloudflare = prefs.genParams.useCloudflare;
+    }
+    console.log(`[Storage] Loaded prefs for ${userId}: tts=${s.ttsEnabled} engine=${s.ttsEngine} mic=${s.micMuted ? 'off' : 'on'}`);
+  } catch (err: any) {
+    console.log(`[Storage] Load failed: ${err.message}`);
   }
 }
 
@@ -1325,7 +1726,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     const shouldSearch = WEB_SEARCH_ENABLED && state.genParams.webSearch && detectSearchIntent(prompt);
     if (shouldSearch) {
       const searchPreview = truncate(prompt, 45);
-      try { await session.layouts.showDoubleTextWall('Searching the web...', `"${searchPreview}"`); } catch {}
+      try { await session.layouts.showTextWall(`Q: ${searchPreview}\n\n🔍 Searching...`); } catch {}
       broadcastToUser(userId, 'state', { processing: true, searching: true, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
       // Update dashboard: searching
       updateDashboard(session, 'Searching...', truncate(prompt, 30), state.history.length);
@@ -1335,7 +1736,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
 
     // Show thinking indicator (replaces search indicator if search ran)
     const thinkPreview = truncate(prompt, 45);
-    try { await session.layouts.showDoubleTextWall('Thinking...', `"${thinkPreview}"`); } catch {}
+    try { await session.layouts.showTextWall(`Q: ${thinkPreview}\n\nThinking...`); } catch {}
 
     state.history.push({ role: 'user', content: prompt });
     // Trim history to prevent context overflow before sending to AI
@@ -1378,25 +1779,233 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     state.pendingRefresh = false;
     broadcastToUser(userId, 'state', { processing: false, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: true });
 
+    // Store last prompt for Q&A header on glasses (page 1 shows Q: on top)
+    state.lastPrompt = truncate(prompt, 40);
+
+    // TTS — fire immediately so voice generates in parallel while pages display on glasses.
+    // Both engines are fire-and-forget; neither blocks the display loop.
+    if (state.ttsEnabled) {
+      if (state.ttsEngine === 'kokoro') {
+        speakWithKokoro(userId, clean).catch(() => {});
+      } else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
+        speakWithElevenLabs(session, clean, userId).catch(() => {});
+      }
+    }
+
     // Apply display truncation at sentence boundary before showing on glasses
     const displayText = truncateForDisplay(clean);
     await showOnGlasses(session, displayText, userId, !!searchContext);
-
-    // TTS — speak response if enabled for this user
-    if (state.ttsEnabled) {
-      if (state.ttsEngine === 'kokoro') {
-        speakWithKokoro(userId, clean).catch(() => {}); // fire-and-forget, never blocks display
-      } else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabs(session, clean).catch(() => {});
-      }
-    }
   } catch (err: any) {
     console.error(`[Error]`, err.message);
-    try { await session.layouts.showDoubleTextWall('GeauxAI  error', truncate(err.message, 80)); } catch {}
+    try { await session.layouts.showTextWall('GeauxAI error\n\n' + truncate(err.message, 80)); } catch {}
     updateDashboard(session, 'Error', truncate(err.message, 30));
     if (state.history.length && state.history[state.history.length - 1].role === 'user') state.history.pop();
     state.isProcessing  = false;
     state.pendingRefresh = false;
+  }
+}
+
+async function handleImagePrompt(
+  userId: string,
+  prompt: string,
+  base64: string,
+  mediaType: string,
+  session: AppSession
+) {
+  const state = getState(userId);
+  if (state.isProcessing) {
+    console.log(`[Busy] Dropped image prompt for ${userId}: still processing`);
+    return;
+  }
+  cancelAutoClearTimer(userId);
+  cancelStatusClearTimer(userId);
+  state.isProcessing = true;
+  broadcastToUser(userId, 'state', {
+    processing: true, searching: false, micMuted: state.micMuted,
+    ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine,
+    connected: activeSessions.has(userId), reload: false,
+  });
+  updateDashboard(session, 'Analyzing image...', truncate(prompt, 30), state.history.length);
+
+  try {
+    let response = '';
+
+    if (state.genParams.useCloudflare && CF_ACCOUNT_ID && CF_API_TOKEN && (state.genParams.model.trim() || '').startsWith('@cf/')) {
+      // Cloudflare vision via OpenAI-compatible endpoint
+      const r = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${CF_API_TOKEN}`,
+          },
+          body: JSON.stringify({
+            model: state.genParams.model.trim() || '@cf/meta/llama-3.2-11b-vision-instruct',
+            max_tokens: state.genParams.maxTokens,
+            messages: [
+              ...state.history,
+              {
+                role: 'user',
+                content: [
+                  { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
+                  { type: 'text', text: prompt },
+                ],
+              },
+            ],
+          }),
+        }
+      );
+      if (!r.ok) throw new Error(`Cloudflare AI error ${r.status}`);
+      response = ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
+
+    } else if (AI_PROVIDER === 'anthropic') {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: state.genParams.model.trim() || AI_MODEL,
+          max_tokens: state.genParams.maxTokens,
+          system: state.genParams.systemPrompt.trim() || DEFAULT_SYSTEM,
+          messages: [
+            ...state.history,
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: mediaType, data: base64 },
+                },
+                { type: 'text', text: prompt },
+              ],
+            },
+          ],
+        }),
+      });
+      if (!r.ok) throw new Error(`Anthropic error ${r.status}`);
+      response = ((await r.json()) as any).content?.find((b: any) => b.type === 'text')?.text?.trim() || 'No response.';
+
+    } else if (AI_PROVIDER === 'openai') {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${OPENAI_KEY}`,
+        },
+        body: JSON.stringify({
+          model: state.genParams.model.trim() || AI_MODEL,
+          max_tokens: state.genParams.maxTokens,
+          messages: [
+            ...state.history,
+            {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
+                { type: 'text', text: prompt },
+              ],
+            },
+          ],
+        }),
+      });
+      if (!r.ok) throw new Error(`OpenAI error ${r.status}`);
+      response = ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
+
+    } else if (AI_PROVIDER === 'ollama') {
+      const modelName = (state.genParams.model.trim() || AI_MODEL).toLowerCase();
+      const isVision = ['llava','moondream','minicpm-v','bakllava','llava-phi','vision'].some(v => modelName.includes(v));
+      if (!isVision) {
+        throw new Error(`Image upload requires a vision model (e.g. llava, moondream). Current model: ${modelName}`);
+      }
+      const r = await fetch(`${OLLAMA_HOST}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: state.genParams.model.trim() || AI_MODEL,
+          stream: false,
+          messages: [
+            ...state.history,
+            { role: 'user', content: prompt, images: [base64] },
+          ],
+          options: {
+            temperature: state.genParams.temperature,
+            top_p: state.genParams.topP,
+            num_predict: state.genParams.maxTokens,
+          },
+        }),
+      });
+      if (!r.ok) throw new Error(`Ollama error ${r.status}`);
+      response = ((await r.json()) as any).message?.content?.trim() || 'No response.';
+    } else {
+      throw new Error(`Image upload not supported for provider: ${AI_PROVIDER}`);
+    }
+
+    const clean = stripMarkdown(response);
+    console.log(`[ImageAI] "${clean.substring(0, 80)}"`);
+
+    state.history.push({ role: 'user', content: `[Image] ${prompt}` });
+    state.history.push({ role: 'assistant', content: clean });
+    if (state.history.length > MAX_HISTORY_PAIRS * 2) {
+      state.history = state.history.slice(-(MAX_HISTORY_PAIRS * 2));
+    }
+    state.lastResponse = clean;
+
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
+    broadcastToUser(userId, 'state', {
+      processing: false, searching: false, micMuted: state.micMuted,
+      ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine,
+      connected: activeSessions.has(userId), reload: true,
+    });
+    state.lastPrompt = truncate(`[Image] ${prompt}`, 40);
+
+    if (state.ttsEnabled) {
+      if (state.ttsEngine === 'kokoro') speakWithKokoro(userId, clean).catch(() => {});
+      else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) speakWithElevenLabs(session, clean, userId).catch(() => {});
+    }
+
+    const displayText = truncateForDisplay(clean);
+    await showOnGlasses(session, displayText, userId, false);
+
+  } catch (err: any) {
+    console.error(`[ImageAI Error]`, err.message);
+    try { await session.layouts.showTextWall('GeauxAI error\n\n' + truncate(err.message, 80)); } catch {}
+    updateDashboard(session, 'Error', truncate(err.message, 30));
+    state.history.push({ role: 'user', content: `[Image] ${prompt}` });
+    state.history.push({ role: 'assistant', content: `⚠️ ${err.message}` });
+    broadcastToUser(userId, 'state', {
+      processing: false, searching: false, micMuted: state.micMuted,
+      ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine,
+      connected: activeSessions.has(userId), reload: true,
+    });
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
+  }
+}
+
+async function transcribeAudio(buffer: Buffer, filename: string, mime: string): Promise<string> {
+  if (!OPENAI_KEY) return '';
+  try {
+    const formData = new FormData();
+    const blob = new Blob([buffer], { type: mime || 'audio/mpeg' });
+    formData.append('file', blob, filename);
+    formData.append('model', 'whisper-1');
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${OPENAI_KEY}` },
+      body: formData,
+    });
+    if (!r.ok) throw new Error(`Whisper error ${r.status}`);
+    const data = (await r.json()) as any;
+    const text = data.text?.trim() || '';
+    console.log(`[Whisper] Transcribed ${buffer.length} bytes → "${text.substring(0, 80)}"`);
+    return text;
+  } catch (err: any) {
+    console.log(`[Whisper] Failed: ${err.message}`);
+    return '';
   }
 }
 
@@ -1405,6 +2014,38 @@ async function callAI(history: { role: string; content: string }[], params: GenP
   const mainSystem = params.systemPrompt.trim() || DEFAULT_SYSTEM;
   // Use per-user selected model if set, otherwise fall back to server default.
   const modelToUse = params.model.trim() || AI_MODEL;
+
+  // ── Cloudflare Workers AI (OpenAI-compatible endpoint) ────────────────────
+  // Only route to Cloudflare if the selected model is actually a CF model (@cf/...)
+  // This prevents sending Ollama model names (e.g. "deepseek-v3.2:cloud") to CF API
+  if (params.useCloudflare && CF_ACCOUNT_ID && CF_API_TOKEN && modelToUse.startsWith('@cf/')) {
+    const messages = searchContext
+      ? [{ role: 'system', content: searchContext }, { role: 'system', content: mainSystem }, ...history]
+      : [{ role: 'system', content: mainSystem }, ...history];
+    const r = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${CF_API_TOKEN}`,
+        },
+        body: JSON.stringify({
+          model: modelToUse,
+          messages,
+          max_tokens: params.maxTokens,
+          temperature: params.temperature,
+          top_p: params.topP,
+          stream: false,
+        }),
+      }
+    );
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => '');
+      throw new Error(`Cloudflare AI error ${r.status}: ${errBody.substring(0, 200)}`);
+    }
+    return ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
+  }
 
   if (AI_PROVIDER === 'ollama') {
     const messages = searchContext
@@ -1498,16 +2139,21 @@ async function showOnGlasses(
     // Update page index in user state for button nav tracking
     if (userState) userState.pageIndex = i;
 
-    // SDK signature: showReferenceCard(title: string, text: string, options?)
-    // Separate string args — NOT an object. The SDK internally builds { title, text }.
-    try {
-      await session.layouts.showReferenceCard(String(titleText), pageText);
-    } catch (err) {
-      console.log('[Display] showReferenceCard failed, falling back to showTextWall:', (err as Error).message);
-      const fallbackText = total > 1
-        ? `[${prefix} ${pageNum}/${total}]\n\n${pageText}`
-        : pageText;
-      try { await session.layouts.showTextWall(fallbackText); } catch { /* display completely failed */ }
+    // All pages: showTextWall — full-width display, confirmed working on G1.
+    // Page 0 with a stored question: prepend "Q: ..." header for context.
+    // Pages 2+: prepend "[N/Total]" page indicator.
+    // showDoubleTextWall and showReferenceCard are NOT used — both render
+    // incorrectly on the G1's 640x200 monochrome display.
+    if (i === 0 && userId) {
+      const qs = getState(userId);
+      if (qs.lastPrompt) {
+        try { await session.layouts.showTextWall(`Q: ${qs.lastPrompt}\n\n${pageText}`); } catch {}
+      } else {
+        try { await session.layouts.showTextWall(pageText); } catch {}
+      }
+    } else {
+      const header = total > 1 ? `[${prefix} ${pageNum}/${total}]\n` : '';
+      try { await session.layouts.showTextWall(header + pageText); } catch {}
     }
 
     if (!isLast) await sleep(PAGE_DELAY);
@@ -1671,25 +2317,25 @@ async function webSearch(query: string): Promise<string> {
   }
 }
 
-async function speakWithElevenLabs(session: AppSession, text: string): Promise<void> {
+async function speakWithElevenLabs(session: AppSession, text: string, userId: string): Promise<void> {
   if (!ELEVENLABS_API_KEY) return;
   try {
     const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
-    const result = await session.audio.speak(safeText, {
-      voice_id: ELEVENLABS_VOICE_ID,
-      model_id: 'eleven_flash_v2_5',
+    const result = await (session.audio as any).speak(safeText, {
+      voice_id: ELEVENLABS_VOICE_ID || undefined,
       voice_settings: {
-        stability: 0.5,
+        stability:        0.5,
         similarity_boost: 0.75,
+        speed:            1.1,
       },
     });
-    if (result.success) {
-      console.log(`[TTS] Spoke ${safeText.length} chars via MentraOS audio`);
+    if (result?.success) {
+      console.log(`[TTS] ElevenLabs spoke ${safeText.length} chars (${result.duration ?? '?'}s) for ${userId}`);
     } else {
-      console.log(`[TTS] Speak failed: ${result.error}`);
+      console.log(`[TTS] ElevenLabs failed: ${result?.error ?? 'unknown error'}`);
     }
   } catch (err: any) {
-    console.log(`[TTS] Failed: ${err.message}`);
+    console.log(`[TTS] ElevenLabs error: ${err.message}`);
   }
 }
 
@@ -1792,9 +2438,11 @@ console.log(`  Package : ${PACKAGE_NAME}`);
 console.log(`  Port    : ${PORT}`);
 console.log(`  AI      : ${AI_PROVIDER} / ${AI_MODEL}`);
 console.log(`  Search  : ${TAVILY_API_KEY ? 'Tavily (live web)' : 'DISABLED — set TAVILY_API_KEY in .env'}`);
+console.log(`  CloudAI : ${CF_API_TOKEN ? 'Cloudflare Workers AI (enabled)' : 'DISABLED — set CF_ACCOUNT_ID & CF_API_TOKEN in .env'}`);
 console.log(`  TTS     : ${ELEVENLABS_API_KEY ? 'ElevenLabs (voice enabled)' : 'DISABLED — set ELEVENLABS_API_KEY in .env'}`);
 console.log(`  Kokoro  : ${KOKORO_HOST} (voice: ${KOKORO_VOICE})`);
 console.log(`  Mode    : VOICE ALWAYS ON + LIVE CHAT LOG`);
 console.log(`  Method  : SSE real-time push`);
+console.log(`  AI Tools: ask_geauxai, web_search (Mira integration)`);
 console.log('════════════════════════════════════════════');
 console.log('');
