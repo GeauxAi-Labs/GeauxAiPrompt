@@ -23,6 +23,7 @@ const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY  || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '';
 const KOKORO_HOST   = process.env.KOKORO_HOST   || 'http://localhost:8880';
 const KOKORO_VOICE  = process.env.KOKORO_VOICE  || '';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://app.geauxailabs.com';
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
 const CF_API_TOKEN  = process.env.CF_API_TOKEN  || '';
 const MAX_HISTORY_PAIRS  = 10;   // keep last 10 user+assistant pairs (20 messages)
@@ -40,7 +41,6 @@ interface GenParams {
   model:        string;  // empty string = use AI_MODEL from .env (server default)
   webSearch:    boolean;
   useCloudflare: boolean;
-  elevenLabsVoiceId: string;
 }
 
 interface UserState {
@@ -82,10 +82,7 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   model:        '',
   webSearch:    true,
   useCloudflare: false,
-  elevenLabsVoiceId: '',
 };
-
-DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
 
 const CF_MODELS: string[] = [
   '@cf/nvidia/nemotron-3-120b-a12b',
@@ -185,6 +182,7 @@ function buildPage(
   ttsEngine: 'elevenlabs' | 'kokoro',
   promptCount: number = 0
 ): string {
+  const modelDisplay = AI_MODEL.split(':')[0];
   const ttsChipLabel = ttsEnabled ? '🔊 VOICE ON' : '🔇 VOICE OFF';
   const engineChipLabel = ttsEngine === 'kokoro' ? '⚡ KOKORO' : '☁ ELEVEN';
   const statusChipClass = processing ? 'chip-thinking' : connected ? 'chip-live' : 'chip-offline';
@@ -311,6 +309,7 @@ body{
 .chip-engine{border-color:var(--v2);color:var(--v3)}
 .chip-x{border-color:var(--edge);color:var(--tx3)}
 .chip-x:active{background:var(--glass);border-color:#ef444460;color:var(--r)}
+#dev-info{font-family:var(--mono);font-size:9px;color:var(--tx3);flex-shrink:0}
 
 /* Status bar */
 .sbar{
@@ -545,6 +544,15 @@ kbd{
     }
   }
 
+  function applyDevice(d){
+    var el=document.getElementById('dev-info');
+    if(!el) return;
+    var bat=d.batteryLevel;
+    var pct=(bat!==null&&bat!==undefined)?bat+'%':'?';
+    var icon=bat<=10?'🪫':'🔋';
+    el.textContent=icon+' '+pct+(d.charging?'⚡':'')+(d.wifiConnected?' 📶':'');
+  }
+
   function applyListening(d){
     var bar=document.getElementById('lbar');
     var txt=document.getElementById('ltxt');
@@ -583,6 +591,7 @@ kbd{
       clearTimeout(sseTimer);
       sseTimer=setTimeout(safeReload,120000);
     });
+    es.addEventListener('device',function(e){try{applyDevice(JSON.parse(e.data));}catch(ex){}});
     es.addEventListener('listening',function(e){try{applyListening(JSON.parse(e.data));}catch(ex){}});
     es.addEventListener('tts_audio', function(e) {
       try {
@@ -636,9 +645,11 @@ kbd{
     <img src="/logo.png" class="logo-img" alt="GeauxAI Labs">
     <div class="hd-text">
       <div class="hd-name">GEAUXAI LABS / GEAUXAIPROMPT</div>
+      <div class="hd-sub">${modelDisplay} · ${AI_PROVIDER.toUpperCase()}</div>
     </div>
   </div>
   <div class="hd-right">
+    <div id="dev-info">⚠️</div>
     <div id="chip-status" class="chip chip-status ${statusChipClass}">${statusChipLabel}</div>
     <button class="chip chip-tts${ttsEnabled ? '' : ' off'}" id="chip-tts" onclick="toggleTTS()">${ttsChipLabel}</button>
     <button class="chip chip-engine" id="chip-engine" onclick="toggleTTSEngine()">${engineChipLabel}</button>
@@ -672,11 +683,6 @@ kbd{
       <span class="p-lbl">MODEL <span class="p-hint">— override default AI model for this session</span></span>
       <select class="p-sel" id="p-model"><option value="">Default (${AI_MODEL})</option></select>
     </div>
-    ${ELEVENLABS_API_KEY ? `
-<div class="p-row" id="p-row-eleven-voice">
-  <span class="p-lbl">ELEVENLABS VOICE <span class="p-hint">— voice used when ELEVEN engine is selected</span></span>
-  <select class="p-sel" id="p-eleven-voice"><option value="">Default (from .env)</option></select>
-</div>` : ''}
     <div class="p-row">
       <span class="p-lbl">AI PROVIDER <span class="p-hint">— switch between local Ollama and Cloudflare cloud AI</span></span>
       <div class="p-tog-row">
@@ -750,7 +756,6 @@ kbd{
     var mdl=document.getElementById('p-model');
     var ws=document.getElementById('p-ws');
     var cf=document.getElementById('p-cf');
-    var elevVoiceEl=document.getElementById('p-eleven-voice');
     if(!sys||!temp||!topp||!mt) return;
     fetch('/api/params'+authQ,{
       method:'POST',headers:{'Content-Type':'application/json'},
@@ -758,8 +763,7 @@ kbd{
         systemPrompt:sys.value,temperature:parseFloat(temp.value),
         topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
         model:mdl?mdl.value:'',webSearch:ws?ws.checked:true,
-        useCloudflare:cf?cf.checked:false,
-        elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:''
+        useCloudflare:cf?cf.checked:false
       })
     }).catch(function(){});
   }
@@ -782,26 +786,8 @@ kbd{
         if(pendingMdl) sel.value=pendingMdl;
       }).catch(function(){});
   }
-  function refreshElevenVoices(selectedId) {
-    fetch('/api/elevenlabs-voices' + authQ)
-      .then(function(r){ return r.ok ? r.json() : null; })
-      .then(function(d){
-        if (!d || !d.voices) return;
-        var sel = document.getElementById('p-eleven-voice');
-        if (!sel) return;
-        while (sel.options.length > 1) sel.remove(1);
-        d.voices.forEach(function(v){
-          var opt = document.createElement('option');
-          opt.value = v.voice_id;
-          opt.textContent = v.name;
-          if (selectedId && v.voice_id === selectedId) opt.selected = true;
-          sel.appendChild(opt);
-        });
-      }).catch(function(){});
-  }
   // Initial load
   refreshModels('ollama');
-  refreshElevenVoices();
 
   fetch('/api/params'+authQ)
     .then(function(r){return r.ok?r.json():null;})
@@ -833,7 +819,6 @@ kbd{
         // Refresh model list for the right provider
         refreshModels(d.useCloudflare?'cloudflare':'ollama');
       }
-      refreshElevenVoices(d.elevenLabsVoiceId || '');
     }).catch(function(){});
 
   var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
@@ -871,8 +856,6 @@ kbd{
   if(mtEl){mtEl.addEventListener('change',sendParams);mtEl.addEventListener('blur',sendParams);}
   var sysEl=document.getElementById('p-sys');
   if(sysEl){sysEl.addEventListener('blur',sendParams);sysEl.addEventListener('input',dSend);}
-  var elevVoiceEl = document.getElementById('p-eleven-voice');
-  if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
 
   window.toggleTTSEngine=function(){
     fetch('/tts-engine'+authQ,{method:'POST'})
@@ -1133,6 +1116,7 @@ class GeauxAIApp extends AppServer {
         }
 
         // Determine direction: right=forward, left=back, unknown=forward
+        const isRight = buttonId === 'right' || buttonId === 'main';
         const isLeft  = buttonId === 'left';
 
         let newIndex = s.pageIndex;
@@ -1320,8 +1304,7 @@ class GeauxAIApp extends AppServer {
         s.history,
         s.micMuted,
         s.ttsEnabled,
-        s.ttsEngine,
-        Math.floor(s.history.length / 2)
+        s.ttsEngine
       );
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -1595,8 +1578,6 @@ class GeauxAIApp extends AppServer {
         s.genParams.webSearch    = b.webSearch;
       if (typeof b.useCloudflare === 'boolean')
         s.genParams.useCloudflare = b.useCloudflare;
-      if (typeof b.elevenLabsVoiceId === 'string')
-        s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
       console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
       const sess = activeSessions.get(userId);
       if (sess) {
@@ -1625,37 +1606,6 @@ class GeauxAIApp extends AppServer {
       } catch {
         res.json({ models: [], default: AI_MODEL });
       }
-    });
-
-    // GET /api/elevenlabs-voices — returns static hardcoded voice list
-    app.get('/api/elevenlabs-voices', (_req: any, res: any) => {
-      res.json({ voices: [
-        { voice_id: 'ZzBpNW0j7Iq2XRx6Xo49', name: 'Indian' },
-        { voice_id: '7QwDAfHpHjPD14XYTSiq', name: 'Asian' },
-	{ voice_id: '0QT4OrDTvpDlUPmFsUWN', name: 'Lily Ausie' },
-	{ voice_id: 'V0PuVTP8lJVnkKNavZmc', name: 'Nigerian' },
-	{ voice_id: 'mKoqwDP2laxTdq1gEgU6', name: 'Casey Kasem' },
-	{ voice_id: 'DLsHlh26Ugcm6ELvS0qi', name: 'Southern' },
-	{ voice_id: '1KFdM0QCwQn4rmn5nn9C', name: 'Parasyte' },
-	{ voice_id: 'xsiB5fGhEtknnqzudCO6', name: 'Smoke The Dragon' },
-	{ voice_id: 'ouL9IsyrSnUkCmfnD02u', name: 'Grimblewood' },
-	{ voice_id: 'JzB4cRKwI655namyRezF', name: 'Thorn' },
-	{ voice_id: 'HIGUfNOdjuWQwwapnTRW', name: 'Chuck Miller' },
-	{ voice_id: 'hA4zGnmTwX2NQiTRMt7o', name: 'Riley' },
-	{ voice_id: 'n7Wi4g1bhpw4Bs8HK5ph', name: 'Gigi' },
-	{ voice_id: 'xzZRXG86mSM3naOyL9fa', name: 'Rowan' },
-	{ voice_id: 'ZTLBC2emTrxYTdCF99Kb', name: 'Rozie' },
-	{ voice_id: '3YMJvGH8HlrOcHJkHNKl', name: 'Amaya' },
-	{ voice_id: 'J8f1H4cMZ1c0AfhHGMag', name: 'Pocholo' },
-	{ voice_id: 'EVHfImLeQUjQG40OZl3q', name: 'Juan' },
-	{ voice_id: 'wNl2YBRc8v5uIcq6gOxd', name: 'Kuya' },
-	{ voice_id: 'bY54gWrN4O4G9QOFtXwl', name: 'Inday' },
-	{ voice_id: 'b8XX4QShLFkd3yZQlz8T', name: 'Ify' },
-	{ voice_id: 'oC2pCZZWEDRe6lmZpaaw', name: 'Bukola' },
-	{ voice_id: 'yp4MmTRKvE7VXY3hUJRY', name: 'Timi' },
-	{ voice_id: 'V2D1qkaFj5NormT9yoaK', name: 'Hoyeen' },
-	{ voice_id: 'TBvIh5TNCMX6pQNIcWV8', name: 'Chidiebere' },
-      ]});
     });
 
     app.get('/tts-audio/:id', (req: any, res: any) => {
@@ -1749,7 +1699,6 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
       if (typeof prefs.genParams.maxTokens   === 'number') s.genParams.maxTokens    = prefs.genParams.maxTokens;
       if (prefs.genParams.model)                           s.genParams.model        = prefs.genParams.model;
       if (typeof prefs.genParams.useCloudflare === 'boolean') s.genParams.useCloudflare = prefs.genParams.useCloudflare;
-      if (typeof prefs.genParams.elevenLabsVoiceId === 'string') s.genParams.elevenLabsVoiceId = prefs.genParams.elevenLabsVoiceId;
     }
     console.log(`[Storage] Loaded prefs for ${userId}: tts=${s.ttsEnabled} engine=${s.ttsEngine} mic=${s.micMuted ? 'off' : 'on'}`);
   } catch (err: any) {
@@ -1839,7 +1788,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
       if (state.ttsEngine === 'kokoro') {
         speakWithKokoro(userId, clean).catch(() => {});
       } else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabs(session, clean, userId, state.genParams.elevenLabsVoiceId).catch(() => {});
+        speakWithElevenLabs(session, clean, userId).catch(() => {});
       }
     }
 
@@ -2015,7 +1964,7 @@ async function handleImagePrompt(
 
     if (state.ttsEnabled) {
       if (state.ttsEngine === 'kokoro') speakWithKokoro(userId, clean).catch(() => {});
-      else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) speakWithElevenLabs(session, clean, userId, state.genParams.elevenLabsVoiceId).catch(() => {});
+      else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) speakWithElevenLabs(session, clean, userId).catch(() => {});
     }
 
     const displayText = truncateForDisplay(clean);
@@ -2070,8 +2019,9 @@ async function callAI(history: { role: string; content: string }[], params: GenP
   // Only route to Cloudflare if the selected model is actually a CF model (@cf/...)
   // This prevents sending Ollama model names (e.g. "deepseek-v3.2:cloud") to CF API
   if (params.useCloudflare && CF_ACCOUNT_ID && CF_API_TOKEN && modelToUse.startsWith('@cf/')) {
-    const cfSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
-    const messages = [{ role: 'system', content: cfSystem }, ...history];
+    const messages = searchContext
+      ? [{ role: 'system', content: searchContext }, { role: 'system', content: mainSystem }, ...history]
+      : [{ role: 'system', content: mainSystem }, ...history];
     const r = await fetch(
       `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
       {
@@ -2098,8 +2048,9 @@ async function callAI(history: { role: string; content: string }[], params: GenP
   }
 
   if (AI_PROVIDER === 'ollama') {
-    const ollamaSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
-    const messages = [{ role: 'system', content: ollamaSystem }, ...history];
+    const messages = searchContext
+      ? [{ role: 'system', content: searchContext }, { role: 'system', content: mainSystem }, ...history]
+      : [{ role: 'system', content: mainSystem }, ...history];
     const r = await fetch(`${OLLAMA_HOST}/api/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2136,8 +2087,9 @@ async function callAI(history: { role: string; content: string }[], params: GenP
   }
 
   // OpenAI (default)
-  const openaiSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
-  const messages = [{ role: 'system', content: openaiSystem }, ...history];
+  const messages = searchContext
+    ? [{ role: 'system', content: searchContext }, { role: 'system', content: mainSystem }, ...history]
+    : [{ role: 'system', content: mainSystem }, ...history];
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_KEY}` },
@@ -2182,6 +2134,7 @@ async function showOnGlasses(
     const pageText = contentPages[i];
     const isLast   = i === contentPages.length - 1;
     const prefix   = fromSearch ? 'Search' : 'GeauxAI';
+    const titleText = total > 1 ? `${prefix} ${pageNum}/${total}` : prefix;
 
     // Update page index in user state for button nav tracking
     if (userState) userState.pageIndex = i;
@@ -2364,12 +2317,12 @@ async function webSearch(query: string): Promise<string> {
   }
 }
 
-async function speakWithElevenLabs(session: AppSession, text: string, userId: string, voiceId?: string): Promise<void> {
+async function speakWithElevenLabs(session: AppSession, text: string, userId: string): Promise<void> {
   if (!ELEVENLABS_API_KEY) return;
   try {
     const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
     const result = await (session.audio as any).speak(safeText, {
-      voice_id: (voiceId || ELEVENLABS_VOICE_ID) || undefined,
+      voice_id: ELEVENLABS_VOICE_ID || undefined,
       voice_settings: {
         stability:        0.5,
         similarity_boost: 0.75,
