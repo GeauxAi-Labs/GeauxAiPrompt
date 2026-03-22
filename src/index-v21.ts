@@ -1,0 +1,3062 @@
+import { AppServer, AppSession } from '@mentra/sdk';
+import multer from 'multer';
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const PORT         = parseInt(process.env.PORT || '3000');
+const PACKAGE_NAME = process.env.PACKAGE_NAME || 'com.geauxailabs.geauxaiprompt';
+const API_KEY      = process.env.MENTRA_API_KEY || '';
+const AI_PROVIDER  = process.env.AI_PROVIDER   || 'ollama';
+const AI_MODEL     = process.env.AI_MODEL      || 'deepseek-v3.1:671b-cloud';
+const WAKE_WORD    = (process.env.WAKE_WORD    || 'Go AI').toLowerCase();
+const OPENAI_KEY   = process.env.OPENAI_API_KEY   || '';
+const ANTHROPIC_KEY= process.env.ANTHROPIC_API_KEY|| '';
+const OLLAMA_HOST  = process.env.OLLAMA_HOST   || 'http://localhost:11434';
+const PAGE_DELAY         = parseInt(process.env.PAGE_DELAY_MS        || '4000');
+const AUTO_CLEAR_DELAY_MS  = parseInt(process.env.AUTO_CLEAR_DELAY_MS  || '15000');
+const STATUS_CLEAR_DELAY_MS = parseInt(process.env.STATUS_CLEAR_DELAY_MS || '5000');
+const OWNER_EMAIL  = process.env.OWNER_EMAIL || '';
+const WEB_SEARCH_ENABLED = process.env.WEB_SEARCH_ENABLED !== 'false';
+const TAVILY_API_KEY     = process.env.TAVILY_API_KEY     || '';
+const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY  || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '';
+const KOKORO_HOST   = process.env.KOKORO_HOST   || 'http://localhost:8880';
+const KOKORO_VOICE  = process.env.KOKORO_VOICE  || '';
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
+const CF_API_TOKEN  = process.env.CF_API_TOKEN  || '';
+const MAX_HISTORY_PAIRS  = 10;   // keep last 10 user+assistant pairs (20 messages)
+const MAX_RESPONSE_CHARS = 8000; // cap runaway model output before display
+const MAX_DISPLAY_CHARS  = 8000; // pagination handles length — no artificial cut
+const RATE_LIMIT_WINDOW_MS   = 60000;  // 60-second rolling window
+const RATE_LIMIT_MAX_REQUESTS = 10;    // max prompts per window
+
+// ── State ─────────────────────────────────────────────────────────────────────
+interface GenParams {
+  systemPrompt: string;
+  temperature:  number;
+  topP:         number;
+  maxTokens:    number;
+  model:        string;  // empty string = use AI_MODEL from .env (server default)
+  webSearch:    boolean;
+  useCloudflare: boolean;
+  elevenLabsVoiceId: string;
+  kokoroVoice: string;
+  avatarEnabled: boolean;
+}
+
+interface UserState {
+  history:        { role: string; content: string }[];
+  lastResponse:   string;
+  isProcessing:   boolean;
+  micMuted:       boolean;
+  pendingRefresh: boolean;  // true after typed prompt — serve one 4s refresh then reset
+  // Pagination state — stored so buttons can navigate without re-running AI
+  pages:          string[];  // paginated chunks of lastResponse
+  pageIndex:      number;    // currently displayed page (0-based)
+  autoClearTimer:  ReturnType<typeof setTimeout> | null;  // per-user AI response auto-clear
+  statusClearTimer: ReturnType<typeof setTimeout> | null;  // per-user status message auto-clear
+  genParams:      GenParams;  // per-user AI generation parameters
+  sseClients:     any[];      // SSE response objects waiting for push events
+  deviceState:    { batteryLevel: number | null; charging: boolean; wifiConnected: boolean; } | null;
+  isListening:    boolean;
+  ttsEnabled:     boolean;
+  ttsEngine:      'elevenlabs' | 'kokoro';
+  lastPrompt:     string;   // last user question shown on glasses (Q&A header)
+}
+const userStates          = new Map<string, UserState>();
+const activeSessions      = new Map<string, AppSession>();
+const devicePollIntervals = new Map<string, ReturnType<typeof setInterval>>();
+const rateLimits          = new Map<string, { count: number; resetTime: number }>();
+const audioCache          = new Map<string, { buf: Buffer; expires: number }>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of audioCache) {
+    if (now > entry.expires) audioCache.delete(id);
+  }
+}, 300_000);
+
+const DEFAULT_GEN_PARAMS: GenParams = {
+  systemPrompt: '',
+  temperature:  0.7,
+  topP:         0.95,
+  maxTokens:    2048,
+  model:        '',
+  webSearch:    true,
+  useCloudflare: false,
+  elevenLabsVoiceId: '',
+  kokoroVoice: '',
+  avatarEnabled: true,
+};
+
+DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
+DEFAULT_GEN_PARAMS.kokoroVoice = KOKORO_VOICE;
+
+const CF_MODELS: string[] = [
+  '@cf/nvidia/nemotron-3-120b-a12b',
+'@cf/zai-org/glm-4.7-flash',
+'@cf/ibm-granite/granite-4.0-h-micro',
+'@cf/aisingapore/gemma-sea-lion-v4-27b-it',
+'@cf/openai/gpt-oss-20b',
+'@cf/qwen/qwen3-30b-a3b-fp8',
+'@cf/meta/llama-4-scout-17b-16e-instruct',
+'@cf/google/gemma-3-12b-it',
+'@cf/mistralai/mistral-small-3.1-24b-instruct',
+'@cf/qwen/qwq-32b',
+'@cf/qwen/qwen2.5-coder-32b-instruct',
+'@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',
+'@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+'@cf/meta/llama-3.2-1b-instruct',
+'@cf/meta/llama-3.2-3b-instruct',
+'@cf/meta/llama-3.1-8b-instruct-awq',
+'@cf/meta/llama-3.1-8b-instruct-fp8',
+'@cf/meta/llama-3-8b-instruct-awq',
+'@cf/meta/llama-3-8b-instruct',
+'@hf/mistral/mistral-7b-instruct-v0.2',
+'@cf/google/gemma-7b-it-lora',
+'@cf/google/gemma-2b-it-lora',
+'@cf/meta-llama/llama-2-7b-chat-hf-lora',
+'@hf/google/gemma-7b-it',
+'@hf/nousresearch/hermes-2-pro-mistral-7b',
+'@cf/mistral/mistral-7b-instruct-v0.2-lora',
+];
+
+function getState(userId: string): UserState {
+  if (!userStates.has(userId)) {
+    userStates.set(userId, {
+      history: [], lastResponse: '', isProcessing: false,
+      micMuted: false, pendingRefresh: false,
+      pages: [], pageIndex: 0, autoClearTimer: null, statusClearTimer: null,
+      genParams: { ...DEFAULT_GEN_PARAMS }, sseClients: [], deviceState: null,
+      isListening: false, ttsEnabled: false, ttsEngine: 'kokoro', lastPrompt: '',
+    });
+  }
+  return userStates.get(userId)!;
+}
+
+function cancelAutoClearTimer(userId: string) {
+  const s = getState(userId);
+  if (s.autoClearTimer !== null) {
+    clearTimeout(s.autoClearTimer);
+    s.autoClearTimer = null;
+    console.log(`[AutoClear] Timer cancelled for ${userId}`);
+  }
+}
+
+function cancelStatusClearTimer(userId: string) {
+  const s = getState(userId);
+  if (s.statusClearTimer !== null) {
+    clearTimeout(s.statusClearTimer);
+    s.statusClearTimer = null;
+    console.log(`[StatusClear] Timer cancelled for ${userId}`);
+  }
+}
+
+function broadcastToUser(userId: string, event: string, data: object) {
+  const s = userStates.get(userId);
+  if (!s || s.sseClients.length === 0) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  s.sseClients = s.sseClients.filter(res => {
+    try { res.write(payload); return true; } catch { return false; }
+  });
+}
+
+async function showStatusOnGlasses(session: AppSession, userId: string, msg: string) {
+  cancelStatusClearTimer(userId);
+  try { await session.layouts.showTextWall('GeauxAI\n' + msg); } catch {}
+  const s = getState(userId);
+  s.statusClearTimer = setTimeout(async () => {
+    s.statusClearTimer = null;
+    const activeSession = activeSessions.get(userId);
+    if (activeSession) {
+      try { await activeSession.layouts.clearView(); } catch {}
+      console.log(`[StatusClear] Display cleared for ${userId}`);
+    }
+  }, STATUS_CLEAR_DELAY_MS);
+  console.log(`[StatusClear] Timer started for ${userId} (${STATUS_CLEAR_DELAY_MS}ms)`);
+}
+
+function esc(t: string): string {
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+}
+
+// ── Web UI ────────────────────────────────────────────────────────────────────
+function buildPage(
+  connected: boolean,
+  processing: boolean,
+  history: { role: string; content: string }[],
+  micMuted: boolean,
+  ttsEnabled: boolean,
+  ttsEngine: 'elevenlabs' | 'kokoro',
+  promptCount: number = 0
+): string {
+  const ttsChipLabel = ttsEnabled ? '🔊 VOICE ON' : '🔇 VOICE OFF';
+  const engineChipLabel = ttsEngine === 'kokoro' ? '⚡ KOKORO' : '☁ ELEVEN';
+  const statusChipClass = processing ? 'chip-thinking' : connected ? 'chip-live' : 'chip-offline';
+  const statusChipLabel = processing ? '● THINKING' : connected ? '● LIVE' : '● OFFLINE';
+  const statusText = processing
+    ? '⏳ Generating response...'
+    : connected
+      ? `🟢 Say &quot;${esc(WAKE_WORD)}&quot; then speak`
+      : '⚪ Waiting for glasses connection...';
+  const dotClass = processing ? 'busy' : connected ? 'ok' : '';
+
+  let bubbles = '';
+  if (history.length === 0) {
+    bubbles = `<div class="empty">
+      <div class="empty-orb">
+        <svg viewBox="0 0 56 56" fill="none"><circle cx="28" cy="28" r="24" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4" opacity=".4"/><circle cx="28" cy="28" r="14" stroke="currentColor" stroke-width="1" opacity=".25"/><circle cx="28" cy="28" r="4" fill="currentColor" opacity=".6"/></svg>
+      </div>
+      <div class="empty-title">GeauxAI is ready</div>
+      <div class="empty-sub">Say <kbd>${esc(WAKE_WORD)}</kbd> then ask anything.<br>Your conversation streams here live.</div>
+    </div>`;
+  } else {
+    for (const msg of history) {
+      const u = msg.role === 'user';
+      let displayContent = msg.content;
+      let attachLabel = '';
+      if (u) {
+        if (msg.content.startsWith('[Image] ')) {
+          attachLabel = '<span style="font-size:10px;color:var(--v3);font-family:var(--mono);margin-bottom:3px;display:block">📎 IMAGE</span>';
+          displayContent = msg.content.slice(8);
+        } else if (msg.content.startsWith('[Audio transcript]:')) {
+          const lines = msg.content.split('\n\n');
+          const userText = lines.slice(1).join('\n\n');
+          const transcript = lines[0].replace('[Audio transcript]: ', '');
+          attachLabel = '<span style="font-size:10px;color:var(--c2);font-family:var(--mono);margin-bottom:3px;display:block">🎤 AUDIO</span>';
+          displayContent = (userText || transcript).slice(0, 200);
+        } else if (msg.content.startsWith('[Document content]:')) {
+          attachLabel = '<span style="font-size:10px;color:var(--g2);font-family:var(--mono);margin-bottom:3px;display:block">📄 DOC</span>';
+          displayContent = msg.content.split('\n\n').slice(1).join('\n\n') || '[document]';
+          displayContent = displayContent.slice(0, 200);
+        }
+      }
+      bubbles += `<div class="msg ${u ? 'msg-u' : 'msg-a'}">
+        <div class="msg-role">${u ? 'YOU' : 'AI'}</div>
+        <div class="msg-body">${attachLabel}${esc(displayContent)}</div>
+      </div>`;
+    }
+    if (processing) {
+      bubbles += `<div class="msg msg-a" id="thinking">
+        <div class="msg-role">AI</div>
+        <div class="msg-body dots"><span></span><span></span><span></span></div>
+      </div>`;
+    }
+  }
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>GeauxAI · G1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#09071a;--bg2:#110e24;--bg3:#1a1630;
+  --glass:#ffffff07;--glass2:#ffffff10;
+  --edge:#ffffff14;--edge2:#ffffff22;
+  --v:#7c3aed;--v2:#a855f7;--v3:#c4b5fd;
+  --c:#06b6d4;--c2:#67e8f9;
+  --g:#10b981;--g2:#34d399;
+  --a:#f59e0b;--r:#ef4444;
+  --tx:#f1f5f9;--tx2:#94a3b8;--tx3:#475569;
+  --mono:'JetBrains Mono',monospace;
+  --ui:'Syne',sans-serif;
+  --rad:12px;
+}
+html{height:100%;-webkit-text-size-adjust:100%}
+body{
+  min-height:100%;background:var(--bg);color:var(--tx);font-family:var(--ui);
+  background-image:
+    radial-gradient(ellipse 70% 40% at 50% 0%,#2d0f5c1a 0%,transparent 65%),
+    radial-gradient(ellipse 40% 25% at 85% 75%,#0a3d4a14 0%,transparent 55%);
+  background-attachment:fixed;
+}
+.shell{display:flex;flex-direction:column;min-height:100dvh;max-width:540px;margin:0 auto}
+
+/* Header */
+.hd{
+  position:sticky;top:0;z-index:20;
+  padding:10px 14px 8px;
+  background:linear-gradient(180deg,var(--bg) 75%,transparent);
+  display:flex;align-items:center;gap:8px;
+}
+.hd-brand{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.logo-img{width:32px;height:32px;flex-shrink:0;border-radius:9px;object-fit:contain;}
+.hd-text{min-width:0}
+.hd-name{
+  font-family:var(--mono);font-size:10px;font-weight:700;
+  color:var(--v3);letter-spacing:.07em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.hd-sub{font-family:var(--mono);font-size:8px;color:var(--tx3);letter-spacing:.04em}
+.hd-right{display:flex;gap:5px;align-items:center;flex-shrink:0}
+
+/* Chips */
+.chip{
+  display:inline-flex;align-items:center;gap:3px;
+  font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.07em;
+  padding:4px 8px;border-radius:99px;border:1px solid;
+  cursor:pointer;background:transparent;-webkit-appearance:none;
+  transition:background .15s,transform .1s;white-space:nowrap;
+}
+.chip:active{transform:scale(.94)}
+.chip-status{pointer-events:none;border-color:var(--edge);color:var(--tx3)}
+.chip-live{border-color:#10b98140;color:var(--g);background:#10b9810a}
+.chip-thinking{border-color:#f59e0b40;color:var(--a);background:#f59e0b0a;animation:blink 1.6s infinite}
+.chip-offline{border-color:var(--edge);color:var(--tx3)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.6}}
+.chip-mic{border-color:var(--g2);color:var(--g2)}
+.chip-mic.muted{border-color:var(--r);color:var(--r)}
+.chip-mic:active{background:var(--glass)}
+.chip-tts{border-color:var(--c);color:var(--c)}
+.chip-tts.off{border-color:var(--edge);color:var(--tx3)}
+.chip-engine{border-color:var(--v2);color:var(--v3)}
+.chip-x{border-color:var(--edge);color:var(--tx3)}
+.chip-x:active{background:var(--glass);border-color:#ef444460;color:var(--r)}
+
+/* Status bar */
+.sbar{
+  display:flex;align-items:center;gap:8px;padding:5px 14px;
+  background:var(--glass);border-bottom:1px solid var(--edge);flex-shrink:0;
+  font-family:var(--mono);font-size:10px;color:var(--tx3);
+}
+.sdot{width:5px;height:5px;border-radius:50%;background:var(--tx3);flex-shrink:0}
+.sdot.ok{background:var(--g);box-shadow:0 0 6px var(--g)}
+.sdot.busy{background:var(--a);box-shadow:0 0 6px var(--a)}
+.stxt{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scount{font-size:8px;color:var(--tx3);flex-shrink:0}
+
+/* Listening bar */
+.lbar{
+  display:none;padding:8px 14px;
+  background:linear-gradient(90deg,transparent,#1c1034 15%,#1c1034 85%,transparent);
+  border-bottom:1px solid #7c3aed28;
+  font-family:var(--mono);font-size:11px;color:var(--v3);
+  align-items:flex-start;gap:8px;
+  max-height:140px;overflow-y:auto;
+}
+.lwave{display:flex;gap:2px;align-items:center;flex-shrink:0}
+.lwave span{
+  display:block;width:2px;background:var(--v2);border-radius:1px;
+  animation:wave .8s ease-in-out infinite;
+}
+.lwave span:nth-child(1){height:5px;animation-delay:0s}
+.lwave span:nth-child(2){height:11px;animation-delay:.1s}
+.lwave span:nth-child(3){height:7px;animation-delay:.2s}
+.lwave span:nth-child(4){height:13px;animation-delay:.15s}
+.lwave span:nth-child(5){height:5px;animation-delay:.05s}
+@keyframes wave{0%,100%{transform:scaleY(1)}50%{transform:scaleY(.35)}}
+.ltxt{flex:1;white-space:pre-wrap;word-break:break-word;line-height:1.55;}
+
+/* Params */
+.params-wrap{border-bottom:1px solid var(--edge);flex-shrink:0}
+.params-btn{
+  width:100%;padding:7px 14px;display:flex;align-items:center;justify-content:space-between;
+  background:transparent;border:none;cursor:pointer;
+  font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--tx3);transition:color .15s;
+}
+.params-btn:hover{color:var(--v3)}
+.params-chev{transition:transform .2s}
+.params-body{padding:10px 14px 14px;background:var(--glass);display:flex;flex-direction:column;gap:11px}
+.p-row{display:flex;flex-direction:column;gap:4px}
+.p-lbl{font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3)}
+.p-hint{font-size:8px;font-weight:400;letter-spacing:.02em;text-transform:none;color:var(--tx3);opacity:.6}
+.p-lbl-row{display:flex;justify-content:space-between;align-items:center}
+.p-val{font-family:var(--mono);font-size:9px;color:var(--v3);background:var(--bg3);padding:1px 6px;border-radius:4px;border:1px solid var(--edge)}
+.p-sys{
+  width:100%;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge);border-radius:var(--rad);
+  font-family:var(--mono);font-size:11px;line-height:1.55;
+  padding:7px 10px;outline:none;resize:vertical;min-height:52px;
+}
+.p-sys:focus{border-color:var(--v2)}.p-sys::placeholder{color:var(--tx3)}
+.p-slider{
+  width:100%;-webkit-appearance:none;height:3px;border-radius:2px;
+  background:var(--edge);outline:none;cursor:pointer;
+}
+.p-slider::-webkit-slider-thumb{
+  -webkit-appearance:none;width:13px;height:13px;border-radius:50%;
+  background:var(--v2);border:2px solid var(--bg);box-shadow:0 0 5px var(--v);
+}
+.p-num{
+  width:100%;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge);border-radius:var(--rad);
+  font-family:var(--mono);font-size:12px;padding:5px 10px;outline:none;
+}
+.p-num:focus{border-color:var(--v2)}
+.p-sel{
+  width:100%;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge);border-radius:var(--rad);
+  font-family:var(--mono);font-size:11px;padding:5px 10px;outline:none;cursor:pointer;
+}
+.p-sel:focus{border-color:var(--v2)}
+.p-tog-row{display:flex;align-items:center;gap:10px}
+.tsw{position:relative;width:36px;height:20px;flex-shrink:0}
+.tsw input{opacity:0;width:0;height:0}
+.ttrack{
+  position:absolute;top:0;left:0;right:0;bottom:0;
+  background:var(--edge);border-radius:10px;cursor:pointer;transition:background .2s;
+}
+.ttrack::before{
+  content:'';position:absolute;width:14px;height:14px;border-radius:50%;
+  left:3px;bottom:3px;background:var(--tx3);transition:.2s;
+}
+.tsw input:checked + .ttrack{background:var(--v)}
+.tsw input:checked + .ttrack::before{transform:translateX(16px);background:#fff}
+.thint{font-family:var(--mono);font-size:8.5px;color:var(--tx3)}
+
+/* Feed */
+.feed{flex:1;padding:12px 14px 120px;display:flex;flex-direction:column;gap:11px;overflow-y:auto}
+
+/* Empty */
+.empty{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:12px;color:var(--tx3);text-align:center;padding:40px 20px;margin-top:10px;
+}
+.empty-orb{width:60px;height:60px;color:var(--v);animation:float 3.5s ease-in-out infinite}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+.empty-title{font-size:15px;font-weight:700;color:var(--tx2)}
+.empty-sub{font-size:12px;line-height:1.75;color:var(--tx3)}
+kbd{
+  display:inline;background:var(--bg3);border:1px solid var(--edge2);
+  border-radius:4px;padding:0 5px;font-family:var(--mono);font-size:11px;color:var(--v3);
+}
+
+/* Messages */
+.msg{display:flex;flex-direction:column;gap:3px;animation:fin .22s cubic-bezier(.16,1,.3,1)}
+@keyframes fin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.msg-role{
+  font-family:var(--mono);font-size:8px;font-weight:700;
+  letter-spacing:.14em;text-transform:uppercase;padding:0 2px;
+}
+.msg-u .msg-role{color:var(--v3)}.msg-a .msg-role{color:var(--c2)}
+.msg-body{
+  padding:9px 12px;border-radius:10px;
+  font-size:13.5px;line-height:1.6;word-break:break-word;
+}
+.msg-u .msg-body{
+  background:linear-gradient(135deg,#2a1a4a,#1a0e38);
+  border:1px solid #7c3aed28;border-bottom-right-radius:3px;
+  max-width:90%;align-self:flex-end;
+}
+.msg-a .msg-body{
+  background:var(--glass);border:1px solid var(--edge);
+  border-bottom-left-radius:3px;max-width:94%;
+}
+
+/* Thinking dots */
+.dots{display:flex;gap:5px;align-items:center;padding:11px 12px}
+.dots span{
+  width:6px;height:6px;border-radius:50%;background:var(--c2);opacity:.25;
+  animation:dp 1.4s ease-in-out infinite;
+}
+.dots span:nth-child(1){animation-delay:0s}.dots span:nth-child(2){animation-delay:.2s}.dots span:nth-child(3){animation-delay:.4s}
+@keyframes dp{0%,80%,100%{opacity:.25;transform:scale(.75)}40%{opacity:1;transform:scale(1)}}
+
+/* Footer */
+.ft{
+  position:fixed;bottom:0;left:0;right:0;max-width:540px;margin:0 auto;
+  padding:10px 14px;padding-bottom:max(14px,env(safe-area-inset-bottom,14px));
+  background:linear-gradient(0deg,var(--bg) 65%,transparent);
+  display:flex;gap:8px;align-items:flex-end;
+}
+.ft-inp{
+  flex:1;background:var(--bg3);color:var(--tx);
+  border:1px solid var(--edge2);border-radius:10px;
+  font-family:var(--ui);font-size:13px;line-height:1.4;
+  padding:9px 12px;outline:none;resize:none;
+  min-height:38px;max-height:100px;
+  transition:border-color .15s;-webkit-appearance:none;
+}
+.ft-inp:focus{border-color:var(--v2);background:#18122e}
+.ft-inp::placeholder{color:var(--tx3)}
+.ft-go{
+  flex-shrink:0;width:38px;height:38px;
+  background:linear-gradient(135deg,var(--v),var(--v2));
+  border:none;border-radius:10px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  font-size:17px;font-weight:700;color:#fff;
+  box-shadow:0 0 14px #7c3aed44;
+  transition:opacity .15s,transform .1s;
+}
+.ft-go:active{transform:scale(.9);opacity:.8}
+.ft-go:disabled{opacity:.28;cursor:not-allowed}
+/* Attach button */
+.ft-attach{
+  flex-shrink:0;width:38px;height:38px;
+  background:var(--bg3);border:1px solid var(--edge2);border-radius:10px;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;
+  font-size:17px;color:var(--tx3);
+  transition:border-color .15s,color .15s;-webkit-appearance:none;
+}
+.ft-attach:hover{border-color:var(--v2);color:var(--v3)}
+.ft-attach.has-file{border-color:var(--v2);color:var(--v3);background:#1a0e38}
+/* File preview chip above the footer */
+.ft-preview{
+  display:none;align-items:center;gap:8px;
+  padding:6px 14px;background:var(--glass);border-top:1px solid var(--edge);
+  font-family:var(--mono);font-size:10px;color:var(--tx2);
+}
+.ft-preview.visible{display:flex}
+.ft-prev-img{width:36px;height:36px;border-radius:6px;object-fit:cover;border:1px solid var(--edge2)}
+.ft-prev-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.ft-prev-rm{background:none;border:none;cursor:pointer;color:var(--tx3);font-size:14px;padding:2px 4px;}
+.ft-prev-rm:hover{color:var(--r)}
+/* ── TTS Avatar ─────────────────────────────────────────────────────────── */
+#tts-avatar{
+  width:100%;height:100%;
+  filter:drop-shadow(0 0 24px #7c3aedbb);
+}
+#tts-avatar.visible{display:block}
+#av-close{
+  position:absolute;top:-8px;right:-8px;
+  width:22px;height:22px;border-radius:50%;
+  background:#1a1630;border:1px solid #7c3aed88;
+  color:#c4b5fd;font-size:11px;line-height:22px;text-align:center;
+  cursor:pointer;pointer-events:all;
+  font-family:var(--mono);font-weight:700;
+  display:none;
+  z-index:2;
+}
+#av-wrap.draggable{cursor:grab}
+#av-wrap.dragging{cursor:grabbing}
+#tts-avatar.visible + #av-close,
+#av-close.visible{display:block}
+</style>
+
+<script>
+(function(){
+  var sp=new URLSearchParams(window.location.search);
+  var tok=sp.get('token')||sp.get('t')||'';
+  var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
+  var sseTimer=null;
+
+  function applyState(d){
+    var dot=document.querySelector('.sdot');
+    var stxt=document.getElementById('stxt');
+    var chip=document.getElementById('chip-status');
+    var mic=document.getElementById('sse-mic');
+    if(dot) dot.className='sdot'+(d.processing?' busy':d.connected?' ok':'');
+    if(stxt) stxt.textContent=d.processing?(d.searching?'🔍 Searching the web...':'⏳ Generating response...'):(d.connected?'🟢 Say "${WAKE_WORD}" then speak':'⚪ Waiting for glasses...');
+    if(chip){
+      chip.className='chip chip-status '+(d.processing?'chip-thinking':d.connected?'chip-live':'chip-offline');
+      chip.textContent=d.processing?'● THINKING':d.connected?'● LIVE':'● OFFLINE';
+    }
+    if(mic&&d.micMuted!==undefined){
+      mic.className='chip chip-mic'+(d.micMuted?' muted':'');
+      mic.textContent=d.micMuted?'🔇 MUTED':'🎤 MIC ON';
+    }
+    if(d.ttsEnabled!==undefined){
+      var tc=document.getElementById('chip-tts');
+      if(tc){tc.textContent=d.ttsEnabled?'🔊 VOICE ON':'🔇 VOICE OFF';
+        if(d.ttsEnabled){tc.classList.remove('off');}else{tc.classList.add('off');}}
+    }
+    if(d.ttsEngine!==undefined){
+      var ec=document.getElementById('chip-engine');
+      if(ec) ec.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
+    }
+    if(d.reload){
+      var inp=document.getElementById('ft-inp');
+      if(inp && inp.value.trim().length>0){
+        // User is typing — reload after they clear/submit instead of wiping their text
+        inp.dataset.pendingReload='1';
+      } else {
+        window.location.reload();
+      }
+    }
+  }
+
+  function applyListening(d){
+    var bar=document.getElementById('lbar');
+    var txt=document.getElementById('ltxt');
+    if(!bar) return;
+    if(d.active){
+      bar.style.display='flex';
+      if(txt){
+        txt.textContent=d.partial?d.partial:'Listening…';
+        bar.scrollTop=bar.scrollHeight;
+      }
+    } else {
+      bar.style.display='none';
+      if(txt) txt.textContent='';
+    }
+  }
+
+  function safeReload(){
+    var inp=document.getElementById('ft-inp');
+    if(inp && inp.value.trim().length>0){
+      inp.dataset.pendingReload='1';
+    } else {
+      window.location.reload();
+    }
+  }
+
+  function connectSSE(){
+    var es=new EventSource('/api/stream'+authQ);
+    clearTimeout(sseTimer);
+    sseTimer=setTimeout(safeReload,120000);
+    es.addEventListener('state',function(e){
+      clearTimeout(sseTimer);
+      sseTimer=setTimeout(safeReload,120000);
+      try{applyState(JSON.parse(e.data));}catch(ex){}
+    });
+    es.addEventListener('keepalive',function(){
+      clearTimeout(sseTimer);
+      sseTimer=setTimeout(safeReload,120000);
+    });
+    es.addEventListener('listening',function(e){try{applyListening(JSON.parse(e.data));}catch(ex){}});
+    es.addEventListener('tts_audio', function(e) {
+      try {
+        var d = JSON.parse(e.data);
+        var player = document.getElementById('_kplayer');
+        if (!player) {
+          player = document.createElement('audio');
+          player.id = '_kplayer';
+          player.controls = false;
+          player.autoplay = true;
+          document.body.appendChild(player);
+        }
+        // Force reload by clearing src first
+        player.pause();
+        player.removeAttribute('src');
+        player.load();
+        player.src = d.url + '?t=' + Date.now();
+        player.load();
+        var p = player.play();
+        if (p !== undefined) {
+          p.catch(function(err) {
+            // Autoplay blocked — show a visible play button as fallback
+            var btn = document.getElementById('_kplay_btn');
+            if (!btn) {
+              btn = document.createElement('button');
+              btn.id = '_kplay_btn';
+              btn.style.cssText = 'position:fixed;bottom:80px;right:20px;z-index:9999;padding:12px 20px;background:#a855f7;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;';
+              btn.textContent = '▶ Play Audio';
+              document.body.appendChild(btn);
+            }
+            btn.style.display = 'block';
+            btn.onclick = function() {
+              player.play();
+              btn.style.display = 'none';
+            };
+          });
+        }
+      } catch(ex) {}
+    });
+    es.onerror=function(){es.close();setTimeout(connectSSE,3000);};
+  }
+  connectSSE();
+})();
+</script>
+</head>
+<body>
+<div class="shell">
+
+<header class="hd">
+  <div class="hd-brand">
+    <img src="/logo.png" class="logo-img" alt="GeauxAI Labs">
+    <div class="hd-text">
+      <div class="hd-name">GEAUXAI LABS / GEAUXAIPROMPT</div>
+    </div>
+  </div>
+  <div class="hd-right">
+    <div id="chip-status" class="chip chip-status ${statusChipClass}">${statusChipLabel}</div>
+    <button class="chip chip-tts${ttsEnabled ? '' : ' off'}" id="chip-tts" onclick="toggleTTS()">${ttsChipLabel}</button>
+    <button class="chip chip-engine" id="chip-engine" onclick="toggleTTSEngine()">${engineChipLabel}</button>
+    <form method="POST" action="/mic" style="margin:0">
+      <button type="submit" id="sse-mic" class="chip chip-mic${micMuted ? ' muted' : ''}">${micMuted ? '🔇 MUTED' : '🎤 MIC ON'}</button>
+    </form>
+    <form method="POST" action="/clear" style="margin:0">
+      <button type="submit" class="chip chip-x">✕ CLEAR</button>
+    </form>
+  </div>
+</header>
+
+<div class="sbar">
+  <div class="sdot ${dotClass}"></div>
+  <div class="stxt" id="stxt">${statusText}</div>
+  ${promptCount > 0 ? `<span class="scount">${promptCount} prompt${promptCount !== 1 ? 's' : ''}</span>` : ''}
+</div>
+
+<div id="lbar" class="lbar">
+  <div class="lwave"><span></span><span></span><span></span><span></span><span></span></div>
+  <div id="ltxt" class="ltxt">Listening…</div>
+</div>
+
+<div class="params-wrap">
+  <button class="params-btn" type="button" onclick="toggleP()" id="params-btn">
+    <span>⚙ SYSTEM PROMPT &amp; PARAMETERS</span>
+    <span class="params-chev" id="params-chev">▼</span>
+  </button>
+  <div class="params-body" id="params-body" style="display:none">
+    <div class="p-row">
+      <span class="p-lbl">MODEL <span class="p-hint">— override default AI model for this session</span></span>
+      <select class="p-sel" id="p-model"><option value="">Default (${AI_MODEL})</option></select>
+    </div>
+    ${ELEVENLABS_API_KEY ? `
+<div class="p-row" id="p-row-eleven-voice">
+  <span class="p-lbl">ELEVENLABS VOICE <span class="p-hint">— voice used when ELEVEN engine is selected</span></span>
+  <select class="p-sel" id="p-eleven-voice"><option value="">Default (from .env)</option></select>
+</div>` : ''}
+    ${KOKORO_HOST ? `
+<div class="p-row" id="p-row-kokoro-voice">
+  <span class="p-lbl">KOKORO VOICE <span class="p-hint">— voice used when KOKORO engine is selected. Supports blending: af_bella+af_sky</span></span>
+  <select class="p-sel" id="p-kokoro-voice"><option value="">Default (from .env)</option></select>
+</div>` : ''}
+    <div class="p-row">
+      <span class="p-lbl">AI PROVIDER <span class="p-hint">— switch between local Ollama and Cloudflare cloud AI</span></span>
+      <div class="p-tog-row">
+        <label class="tsw"><input type="checkbox" id="p-cf"><span class="ttrack"></span></label>
+        <span class="thint" id="p-cf-hint">OLLAMA — local models</span>
+      </div>
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">WEB SEARCH <span class="p-hint">— inject live results for current events &amp; facts</span></span>
+      <div class="p-tog-row">
+        <label class="tsw"><input type="checkbox" id="p-ws"><span class="ttrack"></span></label>
+        <span class="thint" id="p-ws-hint">OFF — model knowledge only</span>
+      </div>
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">TTS AVATAR <span class="p-hint">— show/hide the floating avatar during TTS playback</span></span>
+      <div class="p-tog-row">
+        <label class="tsw"><input type="checkbox" id="p-avatar" checked><span class="ttrack"></span></label>
+        <span class="thint" id="p-avatar-hint">ON — avatar appears during speech</span>
+      </div>
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">SYSTEM PROMPT <span class="p-hint">— sets AI persona / behavior for the session</span></span>
+      <textarea class="p-sys" id="p-sys" rows="3" placeholder="Optional system prompt…"></textarea>
+    </div>
+    <div class="p-row">
+      <div class="p-lbl-row"><span class="p-lbl">TEMPERATURE <span class="p-hint">— creativity/randomness (0=precise · 1=balanced · 2=wild)</span></span><span class="p-val" id="p-tv">0.70</span></div>
+      <input type="range" class="p-slider" id="p-temp" min="0" max="2" step="0.05" value="0.7">
+    </div>
+    <div class="p-row">
+      <div class="p-lbl-row"><span class="p-lbl">TOP P <span class="p-hint">— token diversity (lower=safer word choices · higher=more varied)</span></span><span class="p-val" id="p-pv">0.95</span></div>
+      <input type="range" class="p-slider" id="p-topp" min="0" max="1" step="0.05" value="0.95">
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">MAX TOKENS <span class="p-hint">— max length of AI response (256–32000)</span></span>
+      <input type="number" class="p-num" id="p-maxtok" min="256" max="32000" value="4096">
+    </div>
+  </div>
+</div>
+
+<div class="feed" id="feed">${bubbles}</div>
+
+<div class="ft-preview" id="ft-preview">
+  <img class="ft-prev-img" id="ft-prev-img" src="" alt="" style="display:none">
+  <span class="ft-prev-name" id="ft-prev-name"></span>
+  <button class="ft-prev-rm" id="ft-prev-rm" title="Remove file">✕</button>
+</div>
+<!-- TTS avatar -->
+<div id="av-wrap" style="position:fixed;bottom:90px;right:14px;z-index:100;width:306px;height:306px;display:none;pointer-events:all;">
+  <svg id="tts-avatar" viewBox="0 0 72 72" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:100%">
+  <defs>
+    <radialGradient id="faceGrad" cx="50%" cy="45%" r="50%">
+      <stop offset="0%" stop-color="#2d1a4a"/>
+      <stop offset="100%" stop-color="#110e24"/>
+    </radialGradient>
+  </defs>
+  <circle cx="36" cy="36" r="34" fill="url(#faceGrad)"
+    stroke="#7c3aed" stroke-width="1.5" stroke-opacity=".6"/>
+  <ellipse cx="25" cy="29" rx="4" ry="4.5" fill="#1a0e38"/>
+  <ellipse id="av-pupil-l" cx="25" cy="29" rx="2.5" ry="3" fill="#a855f7" opacity=".9"/>
+  <ellipse cx="47" cy="29" rx="4" ry="4.5" fill="#1a0e38"/>
+  <ellipse id="av-pupil-r" cx="47" cy="29" rx="2.5" ry="3" fill="#a855f7" opacity=".9"/>
+  <circle cx="26.5" cy="27.5" r="1" fill="#c4b5fd" opacity=".8"/>
+  <circle cx="48.5" cy="27.5" r="1" fill="#c4b5fd" opacity=".8"/>
+  <!-- Eyelids — ry animated to 4.5 (closed) or 0 (open) via JS -->
+  <ellipse id="av-lid-l" cx="25" cy="29" rx="4.2" ry="0"
+    fill="#110e24"/>
+  <ellipse id="av-lid-r" cx="47" cy="29" rx="4.2" ry="0"
+    fill="#110e24"/>
+  <circle cx="36" cy="37" r="1.2" fill="#7c3aed" opacity=".35"/>
+  <ellipse id="av-mouth" cx="36" cy="47" rx="7" ry="1.2"
+    fill="#0d0920" stroke="#a855f7" stroke-width="1.3"/>
+  <circle cx="36" cy="36" r="34" fill="none"
+    stroke="#7c3aed" stroke-width=".8" stroke-opacity=".25"
+    stroke-dasharray="4 7">
+    <animateTransform attributeName="transform" type="rotate"
+      from="0 36 36" to="360 36 36" dur="14s" repeatCount="indefinite"/>
+  </circle>
+</svg>
+  <div id="av-close" onclick="window._avClose && window._avClose()">✕</div>
+</div>
+<footer class="ft">
+  <input type="file" id="ft-file" accept="image/*,audio/*,.pdf,.txt" style="display:none">
+  <button class="ft-attach" id="ft-attach" title="Attach image, audio, or document">📎</button>
+  <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="10000" rows="1"></textarea>
+  <button class="ft-go" id="ft-go" title="Send">↑</button>
+</footer>
+</div>
+
+<script>
+(function(){
+  var sp=new URLSearchParams(window.location.search);
+  var tok=sp.get('token')||sp.get('t')||'';
+  var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
+  var pOpen=false;
+
+  window.toggleP=function(){
+    pOpen=!pOpen;
+    var b=document.getElementById('params-body');
+    var c=document.getElementById('params-chev');
+    if(b) b.style.display=pOpen?'flex':'none';
+    if(c) c.textContent=pOpen?'▲':'▼';
+  };
+
+  function deb(fn,ms){var t;return function(){clearTimeout(t);t=setTimeout(fn,ms);};}
+
+  function sendParams(){
+    var sys=document.getElementById('p-sys');
+    var temp=document.getElementById('p-temp');
+    var topp=document.getElementById('p-topp');
+    var mt=document.getElementById('p-maxtok');
+    var mdl=document.getElementById('p-model');
+    var ws=document.getElementById('p-ws');
+    var cf=document.getElementById('p-cf');
+    var elevVoiceEl=document.getElementById('p-eleven-voice');
+    var kokoroVoiceEl=document.getElementById('p-kokoro-voice');
+    var avatarEl=document.getElementById('p-avatar');
+    if(!sys||!temp||!topp||!mt) return;
+    fetch('/api/params'+authQ,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        systemPrompt:sys.value,temperature:parseFloat(temp.value),
+        topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
+        model:mdl?mdl.value:'',webSearch:ws?ws.checked:true,
+        useCloudflare:cf?cf.checked:false,
+        elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
+        kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
+        ,avatarEnabled:avatarEl?!!avatarEl.checked:true
+      })
+    }).catch(function(){});
+  }
+  var dSend=deb(sendParams,600);
+
+  var pendingMdl='';
+  function refreshModels(provider){
+    var url='/api/models'+(provider==='cloudflare'?'?provider=cloudflare':'');
+    fetch(url)
+      .then(function(r){return r.ok?r.json():null;})
+      .then(function(d){
+        if(!d||!d.models) return;
+        var sel=document.getElementById('p-model');
+        if(!sel) return;
+        // Clear existing options except the first (default)
+        while(sel.options.length>1) sel.remove(1);
+        // Update default option text
+        sel.options[0].textContent='Default ('+d.default+')';
+        d.models.forEach(function(m){var o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);});
+        if(pendingMdl) sel.value=pendingMdl;
+      }).catch(function(){});
+  }
+  function refreshElevenVoices(selectedId) {
+    fetch('/api/elevenlabs-voices' + authQ)
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d || !d.voices) return;
+        var sel = document.getElementById('p-eleven-voice');
+        if (!sel) return;
+        while (sel.options.length > 1) sel.remove(1);
+        d.voices.forEach(function(v){
+          var opt = document.createElement('option');
+          opt.value = v.voice_id;
+          opt.textContent = v.name;
+          if (selectedId && v.voice_id === selectedId) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      }).catch(function(){});
+  }
+  function refreshKokoroVoices(selectedId) {
+    fetch('/api/kokoro-voices' + authQ)
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d || !d.voices) return;
+        var sel = document.getElementById('p-kokoro-voice');
+        if (!sel) return;
+        while (sel.options.length > 1) sel.remove(1);
+        d.voices.forEach(function(v){
+          var opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = v;
+          if (selectedId && v === selectedId) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      }).catch(function(){});
+  }
+  // Initial load
+  refreshModels('ollama');
+  refreshElevenVoices();
+  refreshKokoroVoices();
+
+  fetch('/api/params'+authQ)
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){
+      if(!d) return;
+      var sys=document.getElementById('p-sys');
+      var temp=document.getElementById('p-temp');
+      var tv=document.getElementById('p-tv');
+      var topp=document.getElementById('p-topp');
+      var pv=document.getElementById('p-pv');
+      var mt=document.getElementById('p-maxtok');
+      var mdl=document.getElementById('p-model');
+      var ws=document.getElementById('p-ws');
+      var wsh=document.getElementById('p-ws-hint');
+      if(sys) sys.value=d.systemPrompt||'';
+      if(temp&&tv){temp.value=d.temperature;tv.textContent=parseFloat(d.temperature).toFixed(2);}
+      if(topp&&pv){topp.value=d.topP;pv.textContent=parseFloat(d.topP).toFixed(2);}
+      if(mt) mt.value=d.maxTokens;
+      if(d.model!==undefined){pendingMdl=d.model;if(mdl) mdl.value=d.model;}
+      if(ws&&d.webSearch!==undefined){
+        ws.checked=!!d.webSearch;
+        if(wsh) wsh.textContent=d.webSearch?'🔍 ON — live web results injected':'OFF — model knowledge only';
+      }
+      var cf=document.getElementById('p-cf');
+      var cfh=document.getElementById('p-cf-hint');
+      if(cf&&d.useCloudflare!==undefined){
+        cf.checked=!!d.useCloudflare;
+        if(cfh) cfh.textContent=d.useCloudflare?'☁ CLOUDFLARE — cloud AI models':'OLLAMA — local models';
+        // Refresh model list for the right provider
+        refreshModels(d.useCloudflare?'cloudflare':'ollama');
+      }
+      refreshElevenVoices(d.elevenLabsVoiceId || '');
+      refreshKokoroVoices(d.kokoroVoice || '');
+      var avatarEl=document.getElementById('p-avatar');
+      var avatarHint=document.getElementById('p-avatar-hint');
+      if(avatarEl&&d.avatarEnabled!==undefined){
+        avatarEl.checked=!!d.avatarEnabled;
+        if(avatarHint) avatarHint.textContent=d.avatarEnabled?'ON — avatar appears during speech':'OFF — avatar hidden';
+      }
+    }).catch(function(){});
+
+  var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
+  if(tempEl&&tvEl){
+    tempEl.addEventListener('input',function(){tvEl.textContent=parseFloat(this.value).toFixed(2);});
+    tempEl.addEventListener('change',sendParams);
+  }
+  var toppEl=document.getElementById('p-topp'),pvEl=document.getElementById('p-pv');
+  if(toppEl&&pvEl){
+    toppEl.addEventListener('input',function(){pvEl.textContent=parseFloat(this.value).toFixed(2);});
+    toppEl.addEventListener('change',sendParams);
+  }
+  var mdlEl=document.getElementById('p-model');
+  if(mdlEl) mdlEl.addEventListener('change',sendParams);
+  var wsEl=document.getElementById('p-ws'),wshEl=document.getElementById('p-ws-hint');
+  if(wsEl) wsEl.addEventListener('change',function(){
+    var on=wsEl.checked;
+    if(wshEl) wshEl.textContent=on?'🔍 ON — live web results injected':'OFF — model knowledge only';
+    fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({webSearch:on})}).catch(function(){});
+  });
+  var cfEl=document.getElementById('p-cf'),cfhEl=document.getElementById('p-cf-hint');
+  if(cfEl) cfEl.addEventListener('change',function(){
+    var on=cfEl.checked;
+    if(cfhEl) cfhEl.textContent=on?'☁ CLOUDFLARE — cloud AI models':'OLLAMA — local models';
+    // Clear selected model when switching providers
+    var mdlSel=document.getElementById('p-model');
+    if(mdlSel) mdlSel.value='';
+    pendingMdl='';
+    // Refresh model dropdown for the new provider
+    refreshModels(on?'cloudflare':'ollama');
+    // Save immediately
+    fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({useCloudflare:on,model:''})}).catch(function(){});
+  });
+  var mtEl=document.getElementById('p-maxtok');
+  if(mtEl){mtEl.addEventListener('change',sendParams);mtEl.addEventListener('blur',sendParams);}
+  var sysEl=document.getElementById('p-sys');
+  if(sysEl){sysEl.addEventListener('blur',sendParams);sysEl.addEventListener('input',dSend);}
+  var elevVoiceEl = document.getElementById('p-eleven-voice');
+  if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
+  var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
+  if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
+  var avTogEl=document.getElementById('p-avatar');
+  var avTogHint=document.getElementById('p-avatar-hint');
+  if(avTogEl) avTogEl.addEventListener('change',function(){
+    var on=avTogEl.checked;
+    if(avTogHint) avTogHint.textContent=on?'ON — avatar appears during speech':'OFF — avatar hidden';
+    fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({avatarEnabled:on})}).catch(function(){});
+  });
+
+  window.toggleTTSEngine=function(){
+    fetch('/tts-engine'+authQ,{method:'POST'})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var chip=document.getElementById('chip-engine');
+        if(chip) chip.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
+      }).catch(function(){});
+  };
+
+  window.toggleTTS=function(){
+    fetch('/tts'+authQ,{method:'POST'})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        var chip=document.getElementById('chip-tts');
+        if(chip){chip.textContent=d.ttsEnabled?'🔊 VOICE ON':'🔇 VOICE OFF';
+          if(d.ttsEnabled){chip.classList.remove('off');}else{chip.classList.add('off');}}
+      }).catch(function(){});
+  };
+
+  // Auto-resize textarea
+  var inp=document.getElementById('ft-inp');
+  if(inp) inp.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px';});
+
+  // AJAX send (no page reload)
+  var btn=document.getElementById('ft-go');
+
+  var attachedFile = null; // holds the File object if user picked one
+
+  // Attach button click — open file picker
+  var attachBtn = document.getElementById('ft-attach');
+  var fileInput = document.getElementById('ft-file');
+  var preview   = document.getElementById('ft-preview');
+  var prevImg   = document.getElementById('ft-prev-img');
+  var prevName  = document.getElementById('ft-prev-name');
+  var prevRm    = document.getElementById('ft-prev-rm');
+
+  if(attachBtn && fileInput) {
+    attachBtn.addEventListener('click', function(){ fileInput.click(); });
+    fileInput.addEventListener('change', function(){
+      var f = fileInput.files && fileInput.files[0];
+      if(!f) return;
+      attachedFile = f;
+      attachBtn.classList.add('has-file');
+      if(preview) preview.classList.add('visible');
+      if(prevName) prevName.textContent = f.name + ' (' + (f.size > 1024*1024 ? (f.size/1024/1024).toFixed(1)+'MB' : (f.size/1024).toFixed(0)+'KB') + ')';
+      // Show image preview if it's an image
+      if(prevImg){
+        if(f.type.startsWith('image/')){
+          var reader = new FileReader();
+          reader.onload = function(ev){ prevImg.src = ev.target.result; prevImg.style.display='block'; };
+          reader.readAsDataURL(f);
+        } else {
+          prevImg.style.display = 'none';
+          prevImg.src = '';
+        }
+      }
+      // Clear the input so the same file can be re-selected
+      fileInput.value = '';
+    });
+  }
+
+  if(prevRm) {
+    prevRm.addEventListener('click', function(){
+      attachedFile = null;
+      if(attachBtn) attachBtn.classList.remove('has-file');
+      if(preview) preview.classList.remove('visible');
+      if(prevImg){ prevImg.src=''; prevImg.style.display='none'; }
+      if(prevName) prevName.textContent = '';
+    });
+  }
+
+  function doSend(){
+    (function(){ var p=document.getElementById('_kplayer'); if(!p){p=document.createElement('audio');p.id='_kplayer';p.autoplay=true;document.body.appendChild(p);} p.pause(); p.src=''; p.muted=true; var s=p.play(); if(s) s.then(function(){p.muted=false;}).catch(function(){}); })();
+    var text = inp ? inp.value.trim() : '';
+    // Require either text OR a file (or both)
+    if(!text && !attachedFile) return;
+    btn.disabled = true;
+
+    var onDone = function(){
+      if(inp){ inp.value=''; inp.style.height='auto'; }
+      // Clear attachment
+      attachedFile = null;
+      if(attachBtn) attachBtn.classList.remove('has-file');
+      if(preview) preview.classList.remove('visible');
+      if(prevImg){ prevImg.src=''; prevImg.style.display='none'; }
+      if(prevName) prevName.textContent='';
+      btn.disabled = false;
+      if(inp && inp.dataset.pendingReload){
+        delete inp.dataset.pendingReload;
+        window.location.reload();
+      }
+    };
+
+    if(attachedFile){
+      // File attached — send as multipart to /upload
+      var fd = new FormData();
+      fd.append('text', text || '');
+      fd.append('file', attachedFile, attachedFile.name);
+      fetch('/upload'+authQ, { method:'POST', body:fd })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if(d.error){
+            // Show error inline in the chat (server error, e.g. wrong model)
+            alert('⚠️ ' + d.error);
+          }
+          onDone();
+        })
+        .catch(function(){ btn.disabled=false; });
+    } else {
+      // No file — send text only to /prompt as before (unchanged behavior)
+      fetch('/prompt'+authQ, {
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'text='+encodeURIComponent(text)
+      }).then(onDone).catch(function(){ btn.disabled=false; });
+    }
+  }
+  if(btn) btn.addEventListener('click',doSend);
+  if(inp) inp.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend();}});
+
+  // Scroll feed to bottom
+  var feed=document.getElementById('feed');
+  if(feed) feed.scrollTop=feed.scrollHeight;
+})();
+</script>
+<script>
+  /* ── TTS Avatar ─────────────────────────────────────────────────────── */
+  (function(){
+    var wrap   = document.getElementById('av-wrap');
+    var avatar = document.getElementById('tts-avatar');
+    var mouth  = document.getElementById('av-mouth');
+    var closeBtn = document.getElementById('av-close');
+    if (!wrap || !avatar || !mouth) return;
+
+    var audioCtx  = null;
+    var analyser  = null;
+    var dataArr   = null;
+    var rafId     = null;
+    var simAnim   = null;
+
+    // Eye animation state
+    var lidL = null;
+    var lidR = null;
+    var pupL = null;
+    var pupR = null;
+    var eyeAnimId = null;   // RAF for pupil drift during speaking
+    var blinkTimer = null;  // setTimeout chain for random blinks
+    var isSpeaking = false; // true while avatar is showing + animating
+
+    initEyes();
+
+    // ── Drag to move ───────────────────────────────────────────────
+    // On first drag we switch from bottom/right to top/left coords
+    // so JS can freely reposition the wrapper.
+    var dragging    = false;
+    var dragOffX    = 0;
+    var dragOffY    = 0;
+    var dragAnchored = true; // true = still using bottom/right CSS
+
+    // ── Float state ───────────────────────────────────────────────────────────
+    var floatRafId  = null;   // requestAnimationFrame id for float loop
+    var floatT      = 0;      // time counter driving the sine paths
+    var floatBaseX  = 0;      // current base left position (px)
+    var floatBaseY  = 0;      // current base top position (px)
+    var floatVX     = 0;      // slow drift velocity X (px/frame)
+    var floatVY     = 0;      // slow drift velocity Y (px/frame)
+    var floatDirTimer = null; // timer to pick new drift direction
+
+    function toTopLeft() {
+      if (!dragAnchored) return;
+      // Convert current bottom/right position to top/left
+      var rect = wrap.getBoundingClientRect();
+      wrap.style.top    = rect.top  + 'px';
+      wrap.style.left   = rect.left + 'px';
+      wrap.style.bottom = 'auto';
+      wrap.style.right  = 'auto';
+      dragAnchored = false;
+    }
+
+    function onDragStart(clientX, clientY) {
+      // Don't start drag if clicking the close button
+      if (closeBtn && closeBtn.contains(document.elementFromPoint(clientX, clientY))) return;
+      toTopLeft();
+      dragging = true;
+      var rect = wrap.getBoundingClientRect();
+      dragOffX = clientX - rect.left;
+      dragOffY = clientY - rect.top;
+      wrap.classList.add('dragging');
+      wrap.classList.remove('draggable');
+    }
+
+    function onDragMove(clientX, clientY) {
+      if (!dragging) return;
+      var newLeft = clientX - dragOffX;
+      var newTop  = clientY - dragOffY;
+      // Clamp within viewport with 10px margin
+      var maxLeft = window.innerWidth  - wrap.offsetWidth  - 10;
+      var maxTop  = window.innerHeight - wrap.offsetHeight - 10;
+      newLeft = Math.max(10, Math.min(newLeft, maxLeft));
+      newTop  = Math.max(10, Math.min(newTop,  maxTop));
+      wrap.style.left = newLeft + 'px';
+      wrap.style.top  = newTop  + 'px';
+    }
+
+    function onDragEnd() {
+      if (!dragging) return;
+      dragging = false;
+      wrap.classList.remove('dragging');
+      wrap.classList.add('draggable');
+      // Re-seed float base position from drop location
+      // so float resumes from where the user left it
+      var rect   = wrap.getBoundingClientRect();
+      floatBaseX = rect.left;
+      floatBaseY = rect.top;
+    }
+
+    // Mouse events
+    wrap.addEventListener('mousedown', function(e) {
+      onDragStart(e.clientX, e.clientY);
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+      onDragMove(e.clientX, e.clientY);
+    });
+    document.addEventListener('mouseup', function() {
+      onDragEnd();
+    });
+
+    // Touch events (mobile webview)
+    wrap.addEventListener('touchstart', function(e) {
+      var t = e.touches[0];
+      onDragStart(t.clientX, t.clientY);
+    }, { passive: true });
+    document.addEventListener('touchmove', function(e) {
+      if (!dragging) return;
+      var t = e.touches[0];
+      onDragMove(t.clientX, t.clientY);
+      e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchend', function() {
+      onDragEnd();
+    });
+
+    // Add initial draggable class so cursor shows on hover
+    wrap.classList.add('draggable');
+    // ── End drag ─────────────────────────────────────────────────────
+
+    // ── Float ─────────────────────────────────────────────────────
+    function pickNewFloatDir() {
+      // Pick a new slow drift direction every 3-6 seconds
+      var angle = Math.random() * Math.PI * 2;
+      var speed = 0.18 + Math.random() * 0.14; // 0.18-0.32 px/frame
+      floatVX = Math.cos(angle) * speed;
+      floatVY = Math.sin(angle) * speed;
+      floatDirTimer = setTimeout(pickNewFloatDir, 3000 + Math.random() * 3000);
+    }
+
+    function floatTick() {
+      if (!dragging) {
+        var w = wrap.offsetWidth  || 306;
+        var h = wrap.offsetHeight || 306;
+        var maxX = window.innerWidth  - w - 10;
+        var maxY = window.innerHeight - h - 10;
+
+        // Advance base position by velocity
+        floatBaseX += floatVX;
+        floatBaseY += floatVY;
+
+        // Add a gentle sine wobble on top of the drift
+        floatT += 0.012;
+        var wobbleX = Math.sin(floatT * 1.3) * 1.8;
+        var wobbleY = Math.cos(floatT)        * 1.4;
+
+        var newLeft = floatBaseX + wobbleX;
+        var newTop  = floatBaseY + wobbleY;
+
+        // Bounce off edges — reverse velocity component on hit
+        if (newLeft < 10)     { newLeft = 10;   floatVX =  Math.abs(floatVX); floatBaseX = 10; }
+        if (newLeft > maxX)   { newLeft = maxX; floatVX = -Math.abs(floatVX); floatBaseX = maxX; }
+        if (newTop  < 10)     { newTop  = 10;   floatVY =  Math.abs(floatVY); floatBaseY = 10; }
+        if (newTop  > maxY)   { newTop  = maxY; floatVY = -Math.abs(floatVY); floatBaseY = maxY; }
+
+        wrap.style.left = newLeft.toFixed(1) + 'px';
+        wrap.style.top  = newTop.toFixed(1)  + 'px';
+      }
+      floatRafId = requestAnimationFrame(floatTick);
+    }
+
+    function startFloat() {
+      // Convert to top/left coords if still using bottom/right
+      toTopLeft();
+      // Seed base position from current rendered position
+      var rect   = wrap.getBoundingClientRect();
+      floatBaseX = rect.left;
+      floatBaseY = rect.top;
+      // Start with a gentle random direction
+      pickNewFloatDir();
+      if (!floatRafId) floatRafId = requestAnimationFrame(floatTick);
+    }
+
+    function stopFloat() {
+      if (floatRafId) { cancelAnimationFrame(floatRafId); floatRafId = null; }
+      if (floatDirTimer) { clearTimeout(floatDirTimer); floatDirTimer = null; }
+    }
+    // ── End float ─────────────────────────────────────────────────
+
+    // ── Eye helpers ───────────────────────────────────────────────
+    function initEyes() {
+      lidL = document.getElementById('av-lid-l');
+      lidR = document.getElementById('av-lid-r');
+      pupL = document.getElementById('av-pupil-l');
+      pupR = document.getElementById('av-pupil-r');
+    }
+
+    function blink() {
+      if (!lidL || !lidR) return;
+      // Close lids over 60ms, hold 40ms, open over 60ms
+      lidL.setAttribute('ry', '4.5');
+      lidR.setAttribute('ry', '4.5');
+      setTimeout(function() {
+        lidL.setAttribute('ry', '0');
+        lidR.setAttribute('ry', '0');
+      }, 100);
+      // Schedule next blink randomly 2-5 seconds away
+      blinkTimer = setTimeout(blink, 2000 + Math.random() * 3000);
+    }
+
+    function startBlink() {
+      if (blinkTimer) return;
+      // Small initial delay so first blink feels natural
+      blinkTimer = setTimeout(blink, 800 + Math.random() * 1500);
+    }
+
+    function stopBlink() {
+      if (blinkTimer) { clearTimeout(blinkTimer); blinkTimer = null; }
+      if (lidL) lidL.setAttribute('ry', '0');
+      if (lidR) lidR.setAttribute('ry', '0');
+    }
+
+    // Pupil drift — slow random movement while speaking
+    // Pupils wander within a 2px radius of center then drift back
+    var pupilTargetX = 0;
+    var pupilTargetY = 0;
+    var pupilCurX = 0;
+    var pupilCurY = 0;
+    var pupilDriftFrames = 0;
+    var pupilDriftTarget = 30;
+
+    function tickPupils() {
+      if (!pupL || !pupR || !isSpeaking) return;
+      pupilDriftFrames++;
+      if (pupilDriftFrames >= pupilDriftTarget) {
+        // Pick a new wander target within ±2 units of eye center
+        pupilTargetX = (Math.random() - 0.5) * 3.5;
+        pupilTargetY = (Math.random() - 0.5) * 2;
+        pupilDriftTarget = 20 + Math.floor(Math.random() * 40);
+        pupilDriftFrames = 0;
+      }
+      // Ease toward target (lerp factor 0.06 = slow drift)
+      pupilCurX += (pupilTargetX - pupilCurX) * 0.06;
+      pupilCurY += (pupilTargetY - pupilCurY) * 0.06;
+      pupL.setAttribute('cx', (25 + pupilCurX).toFixed(2));
+      pupL.setAttribute('cy', (29 + pupilCurY).toFixed(2));
+      pupR.setAttribute('cx', (47 + pupilCurX).toFixed(2));
+      pupR.setAttribute('cy', (29 + pupilCurY).toFixed(2));
+      eyeAnimId = requestAnimationFrame(tickPupils);
+    }
+
+    function startEyeAnim() {
+      isSpeaking = true;
+      startBlink();
+      if (!eyeAnimId) eyeAnimId = requestAnimationFrame(tickPupils);
+    }
+
+    function stopEyeAnim() {
+      isSpeaking = false;
+      stopBlink();
+      if (eyeAnimId) { cancelAnimationFrame(eyeAnimId); eyeAnimId = null; }
+      // Return pupils to center
+      if (pupL) { pupL.setAttribute('cx', '25'); pupL.setAttribute('cy', '29'); }
+      if (pupR) { pupR.setAttribute('cx', '47'); pupR.setAttribute('cy', '29'); }
+      pupilCurX = 0; pupilCurY = 0;
+      pupilTargetX = 0; pupilTargetY = 0;
+    }
+    // ── End eye helpers ───────────────────────────────────────────
+
+    function initCtx(audioEl) {
+      if (audioCtx) return;
+      try {
+        audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+        analyser  = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        dataArr   = new Uint8Array(analyser.frequencyBinCount);
+        var src   = audioCtx.createMediaElementSource(audioEl);
+        src.connect(analyser);
+        analyser.connect(audioCtx.destination);
+      } catch(e) { audioCtx = null; }
+    }
+
+    function getRMS() {
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(dataArr);
+      var sum = 0;
+      for (var i = 0; i < dataArr.length; i++) {
+        var v = (dataArr[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / dataArr.length);
+    }
+
+    function tick() {
+      var ry = Math.min(6, Math.max(1.2, getRMS() * 22));
+      mouth.setAttribute('ry', ry.toFixed(1));
+      rafId = requestAnimationFrame(tick);
+    }
+
+    function stopSimAnim() {
+      if (simAnim) { clearInterval(simAnim); simAnim = null; }
+    }
+
+    function showAvatar(audioEl) {
+      var _avPref = document.getElementById('p-avatar');
+      if (_avPref && !_avPref.checked) return;
+      if (audioEl) {
+        stopSimAnim();
+        initCtx(audioEl);
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        if (!rafId) rafId = requestAnimationFrame(tick);
+      } else {
+        if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+        stopSimAnim();
+        var speechState = 0;
+        var stateFrames = 0;
+        var stateTarget = 3;
+        simAnim = setInterval(function() {
+          stateFrames++;
+          if (stateFrames >= stateTarget) {
+            var r = Math.random();
+            if (r < 0.12)      { speechState = 0; stateTarget = 2 + Math.floor(Math.random() * 4); }
+            else if (r < 0.35) { speechState = 3; stateTarget = 1 + Math.floor(Math.random() * 3); }
+            else if (r < 0.65) { speechState = 1; stateTarget = 2 + Math.floor(Math.random() * 4); }
+            else               { speechState = 2; stateTarget = 2 + Math.floor(Math.random() * 5); }
+            stateFrames = 0;
+          }
+          var baseRy;
+          if      (speechState === 0) baseRy = 1.2;
+          else if (speechState === 1) baseRy = 3.0;
+          else if (speechState === 2) baseRy = 5.2;
+          else                        baseRy = 1.8;
+          var jitter = (Math.random() - 0.5) * 0.6;
+          var ry = Math.min(6, Math.max(1.2, baseRy + jitter));
+          mouth.setAttribute('ry', ry.toFixed(1));
+        }, 65);
+      }
+      wrap.style.display = 'block';
+      if (closeBtn) closeBtn.style.display = 'block';
+      startEyeAnim();
+      startFloat();
+    }
+
+    function hideAvatar() {
+      stopSimAnim();
+      wrap.style.display = 'none';
+      if (closeBtn) closeBtn.style.display = 'none';
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      mouth.setAttribute('ry', '1.2');
+      stopEyeAnim();
+      stopFloat();
+    }
+
+    function restMouth() {
+      stopSimAnim();
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      mouth.setAttribute('ry', '1.2');
+      stopEyeAnim();
+      // Restart idle blink while avatar stays visible after speaking
+      startBlink();
+    }
+
+    // Close button handler
+    window._avClose = hideAvatar;
+
+    // ── Kokoro path ───────────────────────────────────────────────────
+    function hookPlayer(el) {
+      if (el._avHooked) return;
+      el._avHooked = true;
+      el.addEventListener('play',  function(){ showAvatar(el); });
+      el.addEventListener('pause', function(){ hideAvatar(); });
+      el.addEventListener('ended', function(){ hideAvatar(); });
+    }
+
+    var existing = document.getElementById('_kplayer');
+    if (existing) hookPlayer(existing);
+
+    new MutationObserver(function(muts) {
+      for (var i = 0; i < muts.length; i++) {
+        var nodes = muts[i].addedNodes;
+        for (var j = 0; j < nodes.length; j++) {
+          if (nodes[j].id === '_kplayer') hookPlayer(nodes[j]);
+        }
+      }
+    }).observe(document.body, { childList: true });
+
+    // ── ElevenLabs path ───────────────────────────────────────────────
+    (function(){
+      var sp2 = new URLSearchParams(window.location.search);
+      var tok2 = sp2.get('token') || sp2.get('t') || '';
+      var authQ2 = tok2 ? ('?' + (sp2.get('token') ? 'token' : 't') + '=' + encodeURIComponent(tok2)) : '';
+      var restTimer = null;
+      try {
+        var es2 = new EventSource('/api/stream' + authQ2);
+        es2.addEventListener('tts_start', function(e) {
+          try {
+            var d = JSON.parse(e.data);
+            if (d.engine === 'elevenlabs') {
+              clearTimeout(restTimer);
+              showAvatar(null);
+              // Use server-estimated duration to stop mouth animation.
+              // estimatedMs already includes BLE + hardware drain buffer.
+              var ms = (d.estimatedMs && d.estimatedMs > 0) ? d.estimatedMs : 12000;
+              restTimer = setTimeout(restMouth, ms);
+            }
+          } catch(ex) {}
+        });
+        // Auto-hide avatar when next prompt starts processing
+        es2.addEventListener('state', function(e) {
+          try {
+            var d = JSON.parse(e.data);
+            if (d.processing === true && wrap.style.display === 'block') {
+              clearTimeout(restTimer);
+              hideAvatar();
+            }
+          } catch(ex) {}
+        });
+      } catch(ex) {}
+    })();
+  })();
+  </script>
+</body>
+</html>`;
+}
+
+// Served when the meta-refresh URL token has expired (after ~3hr session).
+// Stops the 401 flood in logs and gives the user a clear message.
+const EXPIRED_PAGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Session Expired — GeauxAiPrompt</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:#0f0d1a;color:#e2e8f0;font-family:system-ui,sans-serif;
+  min-height:100%;display:flex;align-items:center;justify-content:center;
+  text-align:center;padding:32px}
+.wrap{max-width:300px}
+.icon{font-size:40px;margin-bottom:16px}
+h2{font-size:17px;color:#a78bfa;margin-bottom:10px;font-family:monospace;letter-spacing:.05em}
+p{font-size:13px;color:#6b7280;line-height:1.65}
+</style>
+</head>
+<body><audio id="_kplayer" style="display:none" preload="auto"></audio>
+<div class="wrap">
+  <div class="icon">🔄</div>
+  <h2>SESSION EXPIRED</h2>
+  <p>Your webview session link has expired.<br><br>
+  Reopen <strong style="color:#e2e8f0">GeauxAiPrompt</strong> from the<br>
+  Mentra app to get a fresh link.</p>
+</div>
+</body>
+</html>`;
+
+// ── App ───────────────────────────────────────────────────────────────────────
+class GeauxAIApp extends AppServer {
+
+  protected async onSession(session: AppSession, sessionId: string, userId: string) {
+    console.log(`[Session] Connected: ${userId}`);
+
+    // Enable dashboard with always-on overlay
+    try {
+      await session.dashboard.mode.set({ enabled: true, alwaysOn: true });
+    } catch {}
+
+    activeSessions.set(userId, session);
+
+    // Restore persisted preferences (TTS, mic, genParams) from previous session
+    await loadUserPrefs(session, userId);
+
+    // Initialize dashboard — show Ready state with model info
+    updateDashboard(session, 'Ready', undefined, getState(userId).history.length);
+    // Expanded dashboard: shown when user looks up — static usage hint
+    try {
+      await (session.dashboard.content as any).writeToExpanded(
+        'GeauxAiPrompt v2\nSay "Go AI" + your question\nOr type on phone'
+      );
+    } catch {}
+
+    // ── Suppress known harmless SDK noise ─────────────────────────────────────
+    // The G1 glasses send "device_state_update" messages that the current SDK
+    // version doesn't recognize yet. This causes a thrown Error that the SDK's
+    // internal error handler catches and logs as ERROR. We intercept it here so
+    // it doesn't flood the console while the SDK team adds support.
+    // Everything works fine — this is purely cosmetic log suppression.
+    const origEmit = (session as any).emit?.bind(session);
+    if (origEmit) {
+      (session as any).emit = (event: string, ...args: any[]) => {
+        if (event === 'error' && args[0]?.message?.includes('device_state_update')) {
+          // Silently ignore — known unhandled message type from G1 firmware
+          return false;
+        }
+        return origEmit(event, ...args);
+      };
+    }
+
+    try { await session.layouts.showTextWall('GeauxAI ready\n\nSay "Go AI" then speak\nChat log on your phone'); } catch {}
+
+    // ── Button handler ────────────────────────────────────────────────────────
+    // G1 has two TouchBars (left temple / right temple).
+    // MentraOS SDK fires onButtonPress with data = { pressType, buttonId, ... }
+    //
+    // buttonId values observed on G1 via MentraOS:
+    //   "right"  — right TouchBar tap
+    //   "left"   — left TouchBar tap
+    //   "main"   — some SDK versions use this for either/both bars
+    //
+    // We log the full raw payload on every press so you can verify exactly what
+    // your hardware sends — check the server console output after pressing each bar.
+    //
+    // Navigation mapping:
+    //   Right short tap  → next page  (forward)
+    //   Left  short tap  → prev page  (back)
+    //   Either long press → clear history (existing behaviour preserved)
+    //
+    // Fallback if buttonId doesn't distinguish sides (older SDK / firmware):
+    //   Short tap → next page (cycles forward through all pages)
+    //   Long press → clear history
+    session.events.onButtonPress(async (data: any) => {
+      const pressType: string  = data.pressType  || '';
+      const buttonId:  string  = data.buttonId   || '';
+      // Log everything so you can confirm exact field names your G1 sends
+      console.log(`[Button] pressType="${pressType}" buttonId="${buttonId}" raw=${JSON.stringify(data)}`);
+
+      const s = getState(userId);
+
+      // Any button press cancels both auto-clear timers
+      cancelAutoClearTimer(userId);
+      cancelStatusClearTimer(userId);
+
+      // Long press on either side = clear history
+      if (pressType === 'long' || pressType === 'long_press') {
+        s.history     = [];
+        s.lastResponse = '';
+        s.pages       = [];
+        s.pageIndex   = 0;
+        console.log(`[Button] Long press — history cleared for ${userId}`);
+        await showStatusOnGlasses(session, userId, 'History cleared.\nReady for new prompts.');
+        updateDashboard(session, 'Ready', 'History cleared', 0);
+        return;
+      }
+
+      // Short press — navigate pages if we have a multi-page response
+      if (pressType === 'short' || pressType === '') {
+        if (s.pages.length === 0) {
+          // No paginated response stored yet — replay last response if available
+          if (s.lastResponse) {
+            console.log(`[Button] Short press, no pages — replaying last response`);
+            try { await showOnGlasses(session, s.lastResponse); } catch {}
+          }
+          return;
+        }
+
+        // Determine direction: right=forward, left=back, unknown=forward
+        const isLeft  = buttonId === 'left';
+
+        let newIndex = s.pageIndex;
+        if (isLeft) {
+          // Previous page — clamp at 0
+          newIndex = Math.max(0, s.pageIndex - 1);
+        } else {
+          // Next page (right or unknown) — clamp at last page
+          newIndex = Math.min(s.pages.length - 1, s.pageIndex + 1);
+        }
+
+        if (newIndex === s.pageIndex && isLeft  && s.pageIndex === 0) {
+          console.log(`[Button] Already at first page`);
+          try { await session.layouts.showTextWall(`[1/${s.pages.length}]\n${s.pages[0]}`); } catch {}
+          return;
+        }
+        if (newIndex === s.pageIndex && !isLeft && s.pageIndex === s.pages.length - 1) {
+          console.log(`[Button] Already at last page`);
+          try { await session.layouts.showTextWall(`[${s.pages.length}/${s.pages.length}]\n${s.pages[s.pageIndex]}`); } catch {}
+          return;
+        }
+
+        s.pageIndex = newIndex;
+        console.log(`[Button] ${isLeft ? 'LEFT←prev' : 'RIGHT→next'} → page ${s.pageIndex + 1}/${s.pages.length}`);
+        try { await session.layouts.showTextWall(`[${s.pageIndex + 1}/${s.pages.length}]\n${s.pages[s.pageIndex]}`); } catch {}
+      }
+    });
+
+    // Transcription: always-on mic, gated by wake word
+    session.events.onTranscription(async (data: any) => {
+      const s2 = getState(userId);
+      if (s2.micMuted) return;  // mic toggled off from webview
+      const transcript = data.text?.trim() || '';
+      if (!data.isFinal) {
+        // Interim result — show voice activity indicator
+        if (transcript.length >= 3) {
+          s2.isListening = true;
+          broadcastToUser(userId, 'listening', { active: true, partial: transcript.trim() });
+        }
+        return;
+      }
+      // Final result
+      s2.isListening = false;
+      broadcastToUser(userId, 'listening', { active: false, partial: '' });
+      const text = transcript;
+      if (!text || text.length < 3) return;
+      // Wake word check — voice-only; typed /prompt bypasses this entirely
+      if (!text.toLowerCase().startsWith(WAKE_WORD)) return;
+      const stripped = text.slice(WAKE_WORD.length).replace(/^[,\s]+/, '').trim();
+      if (!stripped) return;
+      console.log(`[WakeWord] Triggered: "${stripped}"`);
+      await handlePrompt(userId, stripped, session);
+    });
+
+    console.log('[Events] transcription, button_press registered');
+
+    // Device state polling — SDK does not expose onDeviceStateChange; instead
+    // we poll session.device every 30 s and broadcast when values change.
+    const devicePollInterval = setInterval(() => {
+      try {
+        const dev = session?.device;
+        if (!dev) return;
+        const snap = {
+          batteryLevel:  dev.batteryLevel  ?? null,
+          charging:      dev.charging      ?? false,
+          wifiConnected: dev.wifiConnected ?? false,
+        };
+        const current = getState(userId).deviceState;
+        if (!current ||
+            current.batteryLevel  !== snap.batteryLevel  ||
+            current.charging      !== snap.charging      ||
+            current.wifiConnected !== snap.wifiConnected) {
+          getState(userId).deviceState = snap;
+          broadcastToUser(userId, 'device', snap);
+        }
+      } catch {}
+    }, 30000);
+    devicePollIntervals.set(userId, devicePollInterval);
+  }
+
+  // ── Mira AI Tool Integration ───────────────────────────────────────────────
+  // Tools registered in MentraOS Developer Console (console.mentra.glass):
+  //   ask_geauxai : { question: string } — Ask GeauxAI a question via Mira
+  //   web_search  : { query:    string } — Search the web via Tavily
+  // Tool calls arrive outside active sessions; they use this server-level hook.
+  protected async onToolCall(toolCall: any): Promise<string | undefined> {
+    console.log(`[ToolCall] ${toolCall.toolId} from ${toolCall.userId}`);
+    try {
+      if (toolCall.toolId === 'ask_geauxai') {
+        const question = toolCall.toolParameters?.question as string;
+        if (!question) return 'Please provide a question.';
+
+        // One-shot AI call — no conversation history for tool calls
+        const userHistory = [{ role: 'user', content: question }];
+        const params      = getState(toolCall.userId).genParams;
+        const response    = await callAI(userHistory, params);
+        const clean       = stripMarkdown(response);
+        console.log(`[ToolCall] Response: "${clean.substring(0, 80)}"`);
+
+        // If user has an active glasses session, also display the answer there
+        const activeSession = activeSessions.get(toolCall.userId);
+        if (activeSession) {
+          const s = getState(toolCall.userId);
+          s.lastPrompt = truncate(question, 40);
+          await showOnGlasses(activeSession, clean, toolCall.userId);
+        }
+        return clean;
+      }
+
+      if (toolCall.toolId === 'web_search') {
+        const query = toolCall.toolParameters?.query as string;
+        if (!query) return 'Please provide a search query.';
+        const results = await webSearch(query);
+        return results || 'No results found.';
+      }
+
+      return undefined; // Unknown tool — let MentraOS handle it
+    } catch (err: any) {
+      console.error(`[ToolCall] Error: ${err.message}`);
+      return `Error: ${err.message}`;
+    }
+  }
+
+  protected async onStop(sessionId: string, userId: string, reason: string) {
+    console.log(`[Session] Stopped: ${userId} (${reason})`);
+    activeSessions.delete(userId);
+    const pollInterval = devicePollIntervals.get(userId);
+    if (pollInterval !== undefined) {
+      clearInterval(pollInterval);
+      devicePollIntervals.delete(userId);
+    }
+  }
+
+  public addRoutes() {
+    const app = this.getExpressApp();
+
+    // Place assets/MainLogo.png in your project root (same dir as src/)
+    // The logo is served at GET /logo.png
+    app.get('/logo.png', async (_req: any, res: any) => {
+      try {
+        const file = Bun.file('assets/MainLogo.png');
+        const buf  = await file.arrayBuffer();
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.end(Buffer.from(buf));
+      } catch {
+        res.status(404).end('Logo not found');
+      }
+    });
+
+    // Required: parse urlencoded form bodies (textarea POST sends text=... urlencoded)
+    // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add both here.
+    app.use(require('express').urlencoded({ extended: false, limit: '1mb' }));
+    app.use(require('express').json({ limit: '25mb' }));
+
+    // ── Per-request user resolver ─────────────────────────────────────────────
+    // The SDK auth middleware sets req.authUserId from the signed token on every
+    // request. We use that so each user sees their OWN conversation and state.
+    // Falls back to OWNER_EMAIL only when the webview is opened without a signed
+    // token (e.g. direct browser hit during local dev) so the owner's dev workflow
+    // is unchanged.
+    const resolveUser = (req: any): string => req.authUserId || OWNER_EMAIL;
+
+    // Serve the live chat page.
+    // The SDK auth middleware runs on every request and sets req.authUserId when token is valid.
+    // When the meta-refresh signed URL token expires (~3hr), it logs "Signed user token invalid"
+    // but still calls next() — our handler runs. We detect expiry via req.authUserId being
+    // absent AND a query parameter the SDK injects for signed URLs. Simplest safe check:
+    // if the request has a 'token' or 't' query param (signed URL) but authUserId is missing,
+    // the token has expired. Serve a friendly page instead of rendering stale history silently.
+    const serve = (req: any, res: any) => {
+      const hasSignedToken = req.query?.token || req.query?.t;
+      const authFailed = hasSignedToken && !req.authUserId;
+      if (authFailed) {
+        console.log('[Webview] Signed token expired — serving expired-session page');
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(401).end(EXPIRED_PAGE_HTML);
+      }
+      const userId = resolveUser(req);
+      const s = getState(userId);
+      const html = buildPage(
+        activeSessions.has(userId),
+        s.isProcessing,
+        s.history,
+        s.micMuted,
+        s.ttsEnabled,
+        s.ttsEngine,
+        Math.floor(s.history.length / 2)
+      );
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.end(html);
+    };
+
+    // POST /clear — "New Chat" button submits this form.
+    // Clears server-side history, notifies glasses if connected,
+    // then redirects back so the browser reloads a fresh empty page.
+    app.post('/clear', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      cancelAutoClearTimer(userId);
+      const s = getState(userId);
+      s.history = [];
+      s.lastResponse = '';
+      s.pages = [];
+      s.pageIndex = 0;
+      console.log(`[WebClear] History cleared for ${userId}`);
+      broadcastToUser(userId, 'state', { processing: false, searching: false, micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine, connected: activeSessions.has(userId), reload: true });
+      const session = activeSessions.get(userId);
+      if (session) {
+        await showStatusOnGlasses(session, userId, 'History cleared.\nReady for new prompts.');
+        updateDashboard(session, 'Ready', 'History cleared', 0);
+      }
+      res.redirect(303, '/webview');
+    });
+
+    app.post('/mic', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      cancelAutoClearTimer(userId);
+      const s = getState(userId);
+      s.micMuted = !s.micMuted;
+      console.log(`[MicToggle] ${userId} micMuted=${s.micMuted}`);
+      broadcastToUser(userId, 'state', { processing: s.isProcessing, searching: false, micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine, connected: activeSessions.has(userId), reload: false });
+      const session = activeSessions.get(userId);
+      if (session) {
+        updateDashboard(session, s.micMuted ? 'Mic Off' : 'Listening');
+        const msg = s.micMuted ? 'Microphone muted.\nTap MIC ON in the app to resume.' : 'Microphone active.\nSpeak into your glasses.';
+        await showStatusOnGlasses(session, userId, msg);
+        saveUserPrefs(session, userId).catch(() => {});
+      }
+      res.redirect(303, '/webview');
+    });
+
+    app.post('/tts', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const s = getState(userId);
+      s.ttsEnabled = !s.ttsEnabled;
+      console.log(`[TTSToggle] ${userId} ttsEnabled=${s.ttsEnabled}`);
+      broadcastToUser(userId, 'state', {
+        processing: s.isProcessing, searching: false,
+        micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
+        connected: activeSessions.has(userId), reload: false,
+      });
+      const activeSession = activeSessions.get(userId);
+      if (activeSession) saveUserPrefs(activeSession, userId).catch(() => {});
+      res.json({ ok: true, ttsEnabled: s.ttsEnabled });
+    });
+
+    app.post('/tts-engine', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const s = getState(userId);
+      s.ttsEngine = s.ttsEngine === 'kokoro' ? 'elevenlabs' : 'kokoro';
+      console.log(`[TTSEngine] ${userId} ttsEngine=${s.ttsEngine}`);
+      broadcastToUser(userId, 'state', {
+        processing: s.isProcessing, searching: false,
+        micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
+        connected: activeSessions.has(userId), reload: false,
+      });
+      const activeSession = activeSessions.get(userId);
+      if (activeSession) saveUserPrefs(activeSession, userId).catch(() => {});
+      res.json({ ok: true, ttsEngine: s.ttsEngine });
+    });
+
+    app.post('/prompt', async (req: any, res: any) => {
+      const text = req.body?.text?.trim();
+      if (!text || text.length < 1) return res.redirect(303, '/webview');
+      const userId = resolveUser(req);
+      const session = activeSessions.get(userId);
+      if (!session) {
+        console.log(`[TypePrompt] No active glasses session for ${userId} — processing as web-only`);
+      }
+      const s = getState(userId);
+      // -- Per-user rate limiting --------------------------------------------
+      const now = Date.now();
+      const rl = rateLimits.get(userId) ?? { count: 0, resetTime: now + RATE_LIMIT_WINDOW_MS };
+      if (now > rl.resetTime) { rl.count = 0; rl.resetTime = now + RATE_LIMIT_WINDOW_MS; }
+      if (rl.count >= RATE_LIMIT_MAX_REQUESTS) {
+        console.log(`[RateLimit] ${userId} hit limit`);
+        rateLimits.set(userId, rl);
+        return res.status(429).json({ error: 'Rate limit exceeded. Try again in 60s.' });
+      }
+      rl.count++;
+      rateLimits.set(userId, rl);
+      if (s.isProcessing) {
+        console.log('[TypePrompt] Already processing — ignored');
+        return res.redirect(303, '/webview');
+      }
+      console.log(`[TypePrompt] ${userId} "${text.substring(0, 60)}"`);
+      getState(userId).pendingRefresh = true;
+      handlePrompt(userId, text, session as AppSession);     // fire-and-forget
+      res.redirect(303, '/webview');
+    });
+
+    // ── File/Image/Audio upload route ─────────────────────────────────────────
+    app.post('/upload', upload.single('file'), async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const session = activeSessions.get(userId);
+      if (!session) {
+        console.log(`[Upload] No active glasses session for ${userId} — processing as web-only`);
+      }
+
+      const text = (req.body?.text || '').trim();
+      const file = req.file; // multer puts the file here
+
+      // Rate limit check (same logic as /prompt)
+      const now = Date.now();
+      const rl = rateLimits.get(userId) ?? { count: 0, resetTime: now + RATE_LIMIT_WINDOW_MS };
+      if (now > rl.resetTime) { rl.count = 0; rl.resetTime = now + RATE_LIMIT_WINDOW_MS; }
+      if (rl.count >= RATE_LIMIT_MAX_REQUESTS) {
+        rateLimits.set(userId, rl);
+        return res.status(429).json({ error: 'Rate limit exceeded. Try again in 60s.' });
+      }
+      rl.count++;
+      rateLimits.set(userId, rl);
+
+      const s = getState(userId);
+      if (s.isProcessing) {
+        return res.status(429).json({ error: 'Already processing a prompt. Please wait.' });
+      }
+
+      // If no file, fall through to normal text prompt
+      if (!file) {
+        if (!text) return res.status(400).json({ error: 'No text or file provided.' });
+        handlePrompt(userId, text, session);
+        return res.json({ ok: true });
+      }
+
+      // Determine file category
+      const mime = file.mimetype || '';
+      const filename = file.originalname || 'file';
+      const isImage = mime.startsWith('image/');
+      const isAudio = mime.startsWith('audio/') || /\.(mp3|wav|m4a|ogg|webm)$/i.test(filename);
+      const isDoc   = mime === 'application/pdf' || mime === 'text/plain' || /\.(pdf|txt)$/i.test(filename);
+
+      console.log(`[Upload] ${userId} file="${filename}" mime="${mime}" size=${file.size}`);
+
+      try {
+        if (isImage) {
+          const base64 = file.buffer.toString('base64');
+          const mediaType = mime || 'image/jpeg';
+          const promptText = text || 'Describe this image in detail.';
+          await handleImagePrompt(userId, promptText, base64, mediaType, session);
+          return res.json({ ok: true });
+        }
+
+        if (isAudio) {
+          if (AI_PROVIDER !== 'openai' || !OPENAI_KEY) {
+            return res.status(400).json({ error: 'Audio transcription requires OpenAI provider with OPENAI_API_KEY set.' });
+          }
+          const transcript = await transcribeAudio(file.buffer, filename, mime);
+          if (!transcript) {
+            return res.status(500).json({ error: 'Audio transcription failed.' });
+          }
+          const combined = text
+            ? `[Audio transcript]: ${transcript}\n\n${text}`
+            : `[Audio transcript]: ${transcript}`;
+          handlePrompt(userId, combined, session);
+          return res.json({ ok: true, transcript });
+        }
+
+        if (isDoc) {
+          let docText = '';
+          if (mime === 'text/plain' || /\.txt$/i.test(filename)) {
+            docText = file.buffer.toString('utf-8');
+          } else {
+            try {
+              const pdfParse = require('pdf-parse');
+              const pdfData = await pdfParse(file.buffer);
+              docText = pdfData.text || '';
+            } catch (err: any) {
+              console.log(`[Upload] PDF parse failed: ${err.message}`);
+              return res.status(500).json({ error: 'Could not extract text from PDF.' });
+            }
+          }
+          docText = docText.slice(0, 8000); // cap context
+          const combined = text
+            ? `[Document content]:\n${docText}\n\n${text}`
+            : `[Document content]:\n${docText}\n\nPlease summarize and analyze this document.`;
+          handlePrompt(userId, combined, session);
+          return res.json({ ok: true });
+        }
+
+        return res.status(400).json({ error: `Unsupported file type: ${mime}` });
+
+      } catch (err: any) {
+        console.error(`[Upload] Error: ${err.message}`);
+        return res.status(500).json({ error: err.message });
+      }
+    });
+
+    // ── SSE real-time push ────────────────────────────────────────────────────
+    // GET /api/stream — client subscribes here; server pushes 'state' events
+    app.get('/api/stream', (req: any, res: any) => {
+      const userId = resolveUser(req);
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+
+      const s = getState(userId);
+      s.sseClients.push(res);
+
+      // Send current state immediately so client doesn't wait for the first change
+      const initData = JSON.stringify({
+        processing: s.isProcessing, searching: false,
+        micMuted: s.micMuted, ttsEnabled: s.ttsEnabled, ttsEngine: s.ttsEngine,
+        connected: activeSessions.has(userId), reload: false,
+      });
+      res.write(`event: state\ndata: ${initData}\n\n`);
+
+      // Send initial device snapshot immediately (battery / charging / wifi)
+      try {
+        const dev = activeSessions.get(userId)?.device;
+        const deviceSnap = {
+          batteryLevel:  dev?.batteryLevel  ?? null,
+          charging:      dev?.charging      ?? false,
+          wifiConnected: dev?.wifiConnected ?? false,
+        };
+        s.deviceState = deviceSnap;
+        broadcastToUser(userId, 'device', deviceSnap);
+      } catch {
+        // device state not available yet, client will show ⚠️
+      }
+
+      const keepalive = setInterval(() => {
+        try { res.write('event: keepalive\ndata: {}\n\n'); } catch { clearInterval(keepalive); }
+      }, 10000);
+
+      req.on('close', () => {
+        clearInterval(keepalive);
+        const s2 = userStates.get(userId);
+        if (s2) s2.sseClients = s2.sseClients.filter(c => c !== res);
+      });
+    });
+
+    // ── Generation params API ─────────────────────────────────────────────────
+    // GET  /api/params — return current per-user gen params as JSON
+    // POST /api/params — update per-user gen params (called from webview JS)
+    app.get('/api/params', (req: any, res: any) => {
+      const userId = resolveUser(req);
+      res.json(getState(userId).genParams);
+    });
+
+    app.post('/api/params', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      const s = getState(userId);
+      const b = req.body || {};
+      if (typeof b.systemPrompt === 'string')
+        s.genParams.systemPrompt = b.systemPrompt.slice(0, 2000);
+      if (typeof b.temperature === 'number')
+        s.genParams.temperature  = Math.min(2, Math.max(0, b.temperature));
+      if (typeof b.topP === 'number')
+        s.genParams.topP         = Math.min(1, Math.max(0, b.topP));
+      if (typeof b.maxTokens === 'number')
+        s.genParams.maxTokens    = Math.min(32000, Math.max(256, Math.round(b.maxTokens)));
+      if (typeof b.model === 'string')
+        s.genParams.model        = b.model.slice(0, 200);
+      if (typeof b.webSearch === 'boolean')
+        s.genParams.webSearch    = b.webSearch;
+      if (typeof b.useCloudflare === 'boolean')
+        s.genParams.useCloudflare = b.useCloudflare;
+      if (typeof b.elevenLabsVoiceId === 'string')
+        s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
+      if (typeof b.kokoroVoice === 'string')
+        s.genParams.kokoroVoice = b.kokoroVoice;
+      if (typeof b.avatarEnabled === 'boolean')
+        s.genParams.avatarEnabled = b.avatarEnabled;
+      console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
+      const sess = activeSessions.get(userId);
+      if (sess) {
+        updateDashboard(sess, 'Ready', undefined, s.history.length);
+        saveUserPrefs(sess, userId).catch(() => {});
+      }
+      res.json({ ok: true });
+    });
+
+    // ── Models API ────────────────────────────────────────────────────────────
+    // GET /api/models — no auth required; read-only metadata
+    // Returns locally available Ollama model names + the server default model.
+    // Pass ?provider=cloudflare to get the Cloudflare model catalog instead.
+    app.get('/api/models', async (req: any, res: any) => {
+      const provider = req.query?.provider;
+      if (provider === 'cloudflare') {
+        return res.json({ models: CF_MODELS, default: CF_MODELS[0] });
+      }
+      // Default: Ollama local models
+      try {
+        const r = await fetch(`${OLLAMA_HOST}/api/tags`);
+        if (!r.ok) throw new Error(`Ollama tags error ${r.status}`);
+        const data = (await r.json()) as any;
+        const models: string[] = (data.models || []).map((m: any) => m.name as string);
+        res.json({ models, default: AI_MODEL });
+      } catch {
+        res.json({ models: [], default: AI_MODEL });
+      }
+    });
+
+    // GET /api/kokoro-voices — fetches available voices from local Kokoro instance
+    app.get('/api/kokoro-voices', async (_req: any, res: any) => {
+      try {
+        const r = await fetch(`${KOKORO_HOST}/v1/audio/voices`);
+        if (!r.ok) throw new Error(`Kokoro voices error ${r.status}`);
+        const data = (await r.json()) as any;
+        // Kokoro returns { voices: ["af_bella", "af_sky", ...] }
+        const voices: string[] = Array.isArray(data.voices) ? data.voices : [];
+        res.json({ voices });
+      } catch {
+        // Return empty list if Kokoro is not running or unreachable
+        res.json({ voices: [] });
+      }
+    });
+
+    // GET /api/elevenlabs-voices — returns static hardcoded voice list
+    app.get('/api/elevenlabs-voices', (_req: any, res: any) => {
+      res.json({ voices: [
+        { voice_id: 'ZzBpNW0j7Iq2XRx6Xo49', name: 'Indian' },
+        { voice_id: '7QwDAfHpHjPD14XYTSiq', name: 'Asian' },
+	{ voice_id: '0QT4OrDTvpDlUPmFsUWN', name: 'Lily Ausie' },
+	{ voice_id: 'V0PuVTP8lJVnkKNavZmc', name: 'Nigerian' },
+	{ voice_id: 'mKoqwDP2laxTdq1gEgU6', name: 'Casey Kasem' },
+	{ voice_id: 'DLsHlh26Ugcm6ELvS0qi', name: 'Southern' },
+	{ voice_id: '1KFdM0QCwQn4rmn5nn9C', name: 'Parasyte' },
+	{ voice_id: 'xsiB5fGhEtknnqzudCO6', name: 'Smoke The Dragon' },
+	{ voice_id: 'ouL9IsyrSnUkCmfnD02u', name: 'Grimblewood' },
+	{ voice_id: 'JzB4cRKwI655namyRezF', name: 'Thorn' },
+	{ voice_id: 'HIGUfNOdjuWQwwapnTRW', name: 'Chuck Miller' },
+	{ voice_id: 'hA4zGnmTwX2NQiTRMt7o', name: 'Riley' },
+	{ voice_id: 'n7Wi4g1bhpw4Bs8HK5ph', name: 'Gigi' },
+	{ voice_id: 'xzZRXG86mSM3naOyL9fa', name: 'Rowan' },
+	{ voice_id: 'ZTLBC2emTrxYTdCF99Kb', name: 'Rozie' },
+	{ voice_id: '3YMJvGH8HlrOcHJkHNKl', name: 'Amaya' },
+	{ voice_id: 'J8f1H4cMZ1c0AfhHGMag', name: 'Pocholo' },
+	{ voice_id: 'EVHfImLeQUjQG40OZl3q', name: 'Juan' },
+	{ voice_id: 'wNl2YBRc8v5uIcq6gOxd', name: 'Kuya' },
+	{ voice_id: 'bY54gWrN4O4G9QOFtXwl', name: 'Inday' },
+	{ voice_id: 'b8XX4QShLFkd3yZQlz8T', name: 'Ify' },
+	{ voice_id: 'oC2pCZZWEDRe6lmZpaaw', name: 'Bukola' },
+	{ voice_id: 'yp4MmTRKvE7VXY3hUJRY', name: 'Timi' },
+	{ voice_id: 'V2D1qkaFj5NormT9yoaK', name: 'Hoyeen' },
+	{ voice_id: 'TBvIh5TNCMX6pQNIcWV8', name: 'Chidiebere' },
+      ]});
+    });
+
+    app.get('/tts-audio/:id', (req: any, res: any) => {
+      const entry = audioCache.get(req.params.id);
+      if (!entry || Date.now() > entry.expires) {
+        res.status(404).send('Not found');
+        return;
+      }
+      // cache expires automatically after 60s
+      res.set('Content-Type', 'audio/mpeg');
+      res.send(entry.buf);
+    });
+
+    app.get('/', serve);
+    app.get('/webview', serve);
+    app.get('/health', (_req: any, res: any) => res.json({ status: 'healthy' }));
+
+    console.log('[Routes] / /webview /health /clear /mic /prompt /upload /api/params /api/models /api/stream /tts-audio/:id registered');
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Glasses-optimized system prompt: short, plain text, no markdown
+const DEFAULT_SYSTEM = 'You are a concise AI assistant on smart glasses. Give short clear answers. Use 2-4 sentences max. No markdown, no bullet points, no numbered lists. Plain sentences only. Be direct and concise. Never use asterisks, hashes, or formatting symbols.';
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+// updateDashboard writes a persistent status to the G1 always-on overlay.
+// Compact line: "GeauxAI | <status>" — always visible.
+// Expanded view: full block shown when user looks up / opens dashboard.
+// All writes are wrapped in try/catch — display failures are non-critical.
+function updateDashboard(
+  session: AppSession,
+  status: string,
+  detail?: string,
+  msgCount?: number
+) {
+  try {
+    // Compact always-on line
+    (session.dashboard.content as any).writeToMain(`GeauxAI | ${status}`);
+
+    // Expanded view (shown when user looks up)
+    const expanded: string[] = [
+      'GeauxAI Labs',
+      `Model: ${AI_MODEL}`,
+      `Status: ${status}`,
+    ];
+    if (detail) expanded.push(detail);
+    if (msgCount !== undefined) expanded.push(`Messages: ${msgCount}`);
+    (session.dashboard.content as any).writeToExpanded(expanded.join('\n'));
+  } catch (e) {
+    // Dashboard content API not available on this firmware — fall back silently
+    try {
+      (session.dashboard.content as any).writeToMain(`GeauxAI | ${status}`);
+    } catch { /* non-critical, continue */ }
+    console.log('[Dashboard] Write failed:', e);
+  }
+}
+
+// ── SimpleStorage: persist user preferences across server restarts ────────────
+
+async function saveUserPrefs(session: AppSession, userId: string): Promise<void> {
+  try {
+    const s = getState(userId);
+    const prefs = {
+      ttsEnabled: s.ttsEnabled,
+      ttsEngine:  s.ttsEngine,
+      micMuted:   s.micMuted,
+      genParams:  s.genParams,
+    };
+    await (session as any).simpleStorage.set('userPrefs', JSON.stringify(prefs));
+    console.log(`[Storage] Saved prefs for ${userId}`);
+  } catch (err: any) {
+    console.log(`[Storage] Save failed: ${err.message}`);
+  }
+}
+
+async function loadUserPrefs(session: AppSession, userId: string): Promise<void> {
+  try {
+    const raw = await (session as any).simpleStorage.get('userPrefs');
+    if (!raw) return;
+    const prefs = JSON.parse(raw);
+    const s = getState(userId);
+    if (typeof prefs.ttsEnabled === 'boolean')                         s.ttsEnabled = prefs.ttsEnabled;
+    if (prefs.ttsEngine === 'kokoro' || prefs.ttsEngine === 'elevenlabs') s.ttsEngine = prefs.ttsEngine;
+    if (typeof prefs.micMuted   === 'boolean')                         s.micMuted   = prefs.micMuted;
+    if (prefs.genParams) {
+      if (prefs.genParams.systemPrompt)                    s.genParams.systemPrompt = prefs.genParams.systemPrompt;
+      if (typeof prefs.genParams.temperature === 'number') s.genParams.temperature  = prefs.genParams.temperature;
+      if (typeof prefs.genParams.topP        === 'number') s.genParams.topP         = prefs.genParams.topP;
+      if (typeof prefs.genParams.maxTokens   === 'number') s.genParams.maxTokens    = prefs.genParams.maxTokens;
+      if (prefs.genParams.model)                           s.genParams.model        = prefs.genParams.model;
+      if (typeof prefs.genParams.useCloudflare === 'boolean') s.genParams.useCloudflare = prefs.genParams.useCloudflare;
+      if (typeof prefs.genParams.elevenLabsVoiceId === 'string') s.genParams.elevenLabsVoiceId = prefs.genParams.elevenLabsVoiceId;
+      if (typeof prefs.genParams.kokoroVoice === 'string') s.genParams.kokoroVoice = prefs.genParams.kokoroVoice;
+      if (typeof prefs.genParams.avatarEnabled === 'boolean') s.genParams.avatarEnabled = prefs.genParams.avatarEnabled;
+    }
+    console.log(`[Storage] Loaded prefs for ${userId}: tts=${s.ttsEnabled} engine=${s.ttsEngine} mic=${s.micMuted ? 'off' : 'on'}`);
+  } catch (err: any) {
+    console.log(`[Storage] Load failed: ${err.message}`);
+  }
+}
+
+async function handlePrompt(userId: string, prompt: string, session: AppSession | undefined) {
+  const state = getState(userId);
+  if (state.isProcessing) {
+    console.log(`[Busy] Dropped prompt for ${userId}: still processing`);
+    return;
+  }
+  cancelAutoClearTimer(userId);
+  cancelStatusClearTimer(userId);
+  state.isProcessing = true;
+  broadcastToUser(userId, 'state', { processing: true, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
+
+  // Update dashboard: thinking
+  if (session) updateDashboard(session, 'Thinking...', truncate(prompt, 30), state.history.length);
+  console.log(`[Prompt] "${prompt.substring(0, 60)}"`);
+
+  try {
+    let searchContext = '';
+    const shouldSearch = WEB_SEARCH_ENABLED && state.genParams.webSearch && detectSearchIntent(prompt);
+    if (shouldSearch) {
+      const searchPreview = truncate(prompt, 45);
+      try { await session?.layouts.showTextWall(`Q: ${searchPreview}\n\n🔍 Searching...`); } catch {}
+      broadcastToUser(userId, 'state', { processing: true, searching: true, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
+      // Update dashboard: searching
+      if (session) updateDashboard(session, 'Searching...', truncate(prompt, 30), state.history.length);
+      console.log(`[Search] Triggered for: "${prompt.substring(0, 60)}"`);
+      searchContext = await webSearch(prompt);
+    }
+
+    // Show thinking indicator (replaces search indicator if search ran)
+    const thinkPreview = truncate(prompt, 45);
+    try { await session?.layouts.showTextWall(`Q: ${thinkPreview}\n\nThinking...`); } catch {}
+
+    state.history.push({ role: 'user', content: prompt });
+    // Trim history to prevent context overflow before sending to AI
+    if (state.history.length > MAX_HISTORY_PAIRS * 2) {
+      state.history = state.history.slice(-(MAX_HISTORY_PAIRS * 2));
+    }
+    const response = await callAI(state.history, state.genParams, searchContext);
+
+    // Sanity check: detect runaway/looping response before display
+    let safeResponse = response;
+    if (response.length > MAX_RESPONSE_CHARS) {
+      const chunk = response.slice(0, 30);
+      const repeatCount = (response.match(
+        new RegExp(chunk.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')
+      ) || []).length;
+      if (repeatCount >= 3) {
+        console.log('[AI] ⚠️ Runaway/looping response detected, truncating');
+        safeResponse = response.slice(0, MAX_RESPONSE_CHARS) + '... [response truncated]';
+      } else {
+        safeResponse = response.slice(0, MAX_RESPONSE_CHARS);
+      }
+    }
+
+    const clean = stripMarkdown(safeResponse);
+    console.log(`[AI] "${clean.substring(0, 80)}"`);
+    state.history.push({ role: 'assistant', content: clean });
+    state.lastResponse = clean;
+    if (state.history.length > MAX_HISTORY_PAIRS * 2) {
+      state.history = state.history.slice(-(MAX_HISTORY_PAIRS * 2));
+    }
+
+    // ── Release processing lock BEFORE showOnGlasses ─────────────────────
+    // showOnGlasses sleeps PAGE_DELAY between each glasses page.
+    // Keeping isProcessing=true during those sleeps holds the webview in
+    // "Thinking..." mode and keeps fast-refreshing long after the AI has
+    // actually finished. Release the lock now — the response is already in
+    // state.history so the next 4s webview refresh shows the full response
+    // while showOnGlasses quietly pages through the glasses display in the bg.
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
+    broadcastToUser(userId, 'state', { processing: false, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: true });
+
+    // Store last prompt for Q&A header on glasses (page 1 shows Q: on top)
+    state.lastPrompt = truncate(prompt, 40);
+
+    // TTS — fire immediately so voice generates in parallel while pages display on glasses.
+    // Both engines are fire-and-forget; neither blocks the display loop.
+    if (state.ttsEnabled) {
+      if (state.ttsEngine === 'kokoro') {
+        speakWithKokoro(userId, clean, state.genParams.kokoroVoice || undefined).catch(() => {});
+      } else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
+        speakWithElevenLabs(session, clean, userId, state.genParams.elevenLabsVoiceId).catch(() => {});
+        // Estimate audio duration from character count.
+        // ElevenLabs at speed 1.1 ≈ 13 chars/sec. Add 2.5s buffer for
+        // BLE transmission and speaker hardware drain.
+        const elevenEstMs = Math.round((clean.length / 13) * 1000) + 2500;
+        // Delay tts_start so the reloaded page has time to re-establish
+        // its SSE connection before the avatar trigger arrives.
+        setTimeout(() => {
+          broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
+        }, 1200);
+      }
+    }
+
+    // Apply display truncation at sentence boundary before showing on glasses
+    const displayText = truncateForDisplay(clean);
+    if (session) await showOnGlasses(session, displayText, userId, !!searchContext);
+  } catch (err: any) {
+    console.error(`[Error]`, err.message);
+    try { await session?.layouts.showTextWall('GeauxAI error\n\n' + truncate(err.message, 80)); } catch {}
+    if (session) updateDashboard(session, 'Error', truncate(err.message, 30));
+    if (state.history.length && state.history[state.history.length - 1].role === 'user') state.history.pop();
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
+  }
+}
+
+async function handleImagePrompt(
+  userId: string,
+  prompt: string,
+  base64: string,
+  mediaType: string,
+  session: AppSession
+) {
+  const state = getState(userId);
+  if (state.isProcessing) {
+    console.log(`[Busy] Dropped image prompt for ${userId}: still processing`);
+    return;
+  }
+  cancelAutoClearTimer(userId);
+  cancelStatusClearTimer(userId);
+  state.isProcessing = true;
+  broadcastToUser(userId, 'state', {
+    processing: true, searching: false, micMuted: state.micMuted,
+    ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine,
+    connected: activeSessions.has(userId), reload: false,
+  });
+  updateDashboard(session, 'Analyzing image...', truncate(prompt, 30), state.history.length);
+
+  try {
+    let response = '';
+
+    if (state.genParams.useCloudflare && CF_ACCOUNT_ID && CF_API_TOKEN && (state.genParams.model.trim() || '').startsWith('@cf/')) {
+      // Cloudflare vision via OpenAI-compatible endpoint
+      const r = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${CF_API_TOKEN}`,
+          },
+          body: JSON.stringify({
+            model: state.genParams.model.trim() || '@cf/meta/llama-3.2-11b-vision-instruct',
+            max_tokens: state.genParams.maxTokens,
+            messages: [
+              ...state.history,
+              {
+                role: 'user',
+                content: [
+                  { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
+                  { type: 'text', text: prompt },
+                ],
+              },
+            ],
+          }),
+        }
+      );
+      if (!r.ok) throw new Error(`Cloudflare AI error ${r.status}`);
+      response = ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
+
+    } else if (AI_PROVIDER === 'anthropic') {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: state.genParams.model.trim() || AI_MODEL,
+          max_tokens: state.genParams.maxTokens,
+          system: state.genParams.systemPrompt.trim() || DEFAULT_SYSTEM,
+          messages: [
+            ...state.history,
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: mediaType, data: base64 },
+                },
+                { type: 'text', text: prompt },
+              ],
+            },
+          ],
+        }),
+      });
+      if (!r.ok) throw new Error(`Anthropic error ${r.status}`);
+      response = ((await r.json()) as any).content?.find((b: any) => b.type === 'text')?.text?.trim() || 'No response.';
+
+    } else if (AI_PROVIDER === 'openai') {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${OPENAI_KEY}`,
+        },
+        body: JSON.stringify({
+          model: state.genParams.model.trim() || AI_MODEL,
+          max_tokens: state.genParams.maxTokens,
+          messages: [
+            ...state.history,
+            {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
+                { type: 'text', text: prompt },
+              ],
+            },
+          ],
+        }),
+      });
+      if (!r.ok) throw new Error(`OpenAI error ${r.status}`);
+      response = ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
+
+    } else if (AI_PROVIDER === 'ollama') {
+      const modelName = (state.genParams.model.trim() || AI_MODEL).toLowerCase();
+      const isVision = ['llava','moondream','minicpm-v','bakllava','llava-phi','vision'].some(v => modelName.includes(v));
+      if (!isVision) {
+        throw new Error(`Image upload requires a vision model (e.g. llava, moondream). Current model: ${modelName}`);
+      }
+      const r = await fetch(`${OLLAMA_HOST}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: state.genParams.model.trim() || AI_MODEL,
+          stream: false,
+          messages: [
+            ...state.history,
+            { role: 'user', content: prompt, images: [base64] },
+          ],
+          options: {
+            temperature: state.genParams.temperature,
+            top_p: state.genParams.topP,
+            num_predict: state.genParams.maxTokens,
+          },
+        }),
+      });
+      if (!r.ok) throw new Error(`Ollama error ${r.status}`);
+      response = ((await r.json()) as any).message?.content?.trim() || 'No response.';
+    } else {
+      throw new Error(`Image upload not supported for provider: ${AI_PROVIDER}`);
+    }
+
+    const clean = stripMarkdown(response);
+    console.log(`[ImageAI] "${clean.substring(0, 80)}"`);
+
+    state.history.push({ role: 'user', content: `[Image] ${prompt}` });
+    state.history.push({ role: 'assistant', content: clean });
+    if (state.history.length > MAX_HISTORY_PAIRS * 2) {
+      state.history = state.history.slice(-(MAX_HISTORY_PAIRS * 2));
+    }
+    state.lastResponse = clean;
+
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
+    broadcastToUser(userId, 'state', {
+      processing: false, searching: false, micMuted: state.micMuted,
+      ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine,
+      connected: activeSessions.has(userId), reload: true,
+    });
+    state.lastPrompt = truncate(`[Image] ${prompt}`, 40);
+
+    if (state.ttsEnabled) {
+      if (state.ttsEngine === 'kokoro') speakWithKokoro(userId, clean, state.genParams.kokoroVoice || undefined).catch(() => {});
+      else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
+        speakWithElevenLabs(session, clean, userId, state.genParams.elevenLabsVoiceId).catch(() => {});
+        // Estimate audio duration from character count.
+        // ElevenLabs at speed 1.1 ≈ 13 chars/sec. Add 2.5s buffer for
+        // BLE transmission and speaker hardware drain.
+        const elevenEstMs = Math.round((clean.length / 13) * 1000) + 2500;
+        // Delay tts_start so the reloaded page has time to re-establish
+        // its SSE connection before the avatar trigger arrives.
+        setTimeout(() => {
+          broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
+        }, 1200);
+      }
+    }
+
+    const displayText = truncateForDisplay(clean);
+    await showOnGlasses(session, displayText, userId, false);
+
+  } catch (err: any) {
+    console.error(`[ImageAI Error]`, err.message);
+    try { await session.layouts.showTextWall('GeauxAI error\n\n' + truncate(err.message, 80)); } catch {}
+    updateDashboard(session, 'Error', truncate(err.message, 30));
+    state.history.push({ role: 'user', content: `[Image] ${prompt}` });
+    state.history.push({ role: 'assistant', content: `⚠️ ${err.message}` });
+    broadcastToUser(userId, 'state', {
+      processing: false, searching: false, micMuted: state.micMuted,
+      ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine,
+      connected: activeSessions.has(userId), reload: true,
+    });
+    state.isProcessing  = false;
+    state.pendingRefresh = false;
+  }
+}
+
+async function transcribeAudio(buffer: Buffer, filename: string, mime: string): Promise<string> {
+  if (!OPENAI_KEY) return '';
+  try {
+    const formData = new FormData();
+    const blob = new Blob([buffer], { type: mime || 'audio/mpeg' });
+    formData.append('file', blob, filename);
+    formData.append('model', 'whisper-1');
+    const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${OPENAI_KEY}` },
+      body: formData,
+    });
+    if (!r.ok) throw new Error(`Whisper error ${r.status}`);
+    const data = (await r.json()) as any;
+    const text = data.text?.trim() || '';
+    console.log(`[Whisper] Transcribed ${buffer.length} bytes → "${text.substring(0, 80)}"`);
+    return text;
+  } catch (err: any) {
+    console.log(`[Whisper] Failed: ${err.message}`);
+    return '';
+  }
+}
+
+async function callAI(history: { role: string; content: string }[], params: GenParams, searchContext?: string): Promise<string> {
+  // Use the user's custom system prompt if set, otherwise fall back to the built-in default.
+  const mainSystem = params.systemPrompt.trim() || DEFAULT_SYSTEM;
+  // Use per-user selected model if set, otherwise fall back to server default.
+  const modelToUse = params.model.trim() || AI_MODEL;
+
+  // ── Cloudflare Workers AI (OpenAI-compatible endpoint) ────────────────────
+  // Only route to Cloudflare if the selected model is actually a CF model (@cf/...)
+  // This prevents sending Ollama model names (e.g. "deepseek-v3.2:cloud") to CF API
+  if (params.useCloudflare && CF_ACCOUNT_ID && CF_API_TOKEN && modelToUse.startsWith('@cf/')) {
+    const cfSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
+    const messages = [{ role: 'system', content: cfSystem }, ...history];
+    const r = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${CF_API_TOKEN}`,
+        },
+        body: JSON.stringify({
+          model: modelToUse,
+          messages,
+          max_tokens: params.maxTokens,
+          temperature: params.temperature,
+          top_p: params.topP,
+          stream: false,
+        }),
+      }
+    );
+    if (!r.ok) {
+      const errBody = await r.text().catch(() => '');
+      throw new Error(`Cloudflare AI error ${r.status}: ${errBody.substring(0, 200)}`);
+    }
+    return ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
+  }
+
+  if (AI_PROVIDER === 'ollama') {
+    const ollamaSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
+    const messages = [{ role: 'system', content: ollamaSystem }, ...history];
+    const r = await fetch(`${OLLAMA_HOST}/api/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelToUse,
+        messages,
+        stream: false,
+        options: {
+          temperature: params.temperature,
+          top_p:       params.topP,
+          num_predict: params.maxTokens,
+        },
+      }),
+    });
+    if (!r.ok) throw new Error(`Ollama error ${r.status}`);
+    return ((await r.json()) as any).message?.content?.trim() || 'No response.';
+  }
+
+  if (AI_PROVIDER === 'anthropic') {
+    const system = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: modelToUse,
+        system,
+        messages:    history,
+        max_tokens:  params.maxTokens,
+        temperature: params.temperature,
+        top_p:       params.topP,
+      }),
+    });
+    if (!r.ok) throw new Error(`Anthropic error ${r.status}`);
+    return ((await r.json()) as any).content?.find((b: any) => b.type === 'text')?.text?.trim() || 'No response.';
+  }
+
+  // OpenAI (default)
+  const openaiSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
+  const messages = [{ role: 'system', content: openaiSystem }, ...history];
+  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_KEY}` },
+    body: JSON.stringify({
+      model: modelToUse,
+      messages,
+      max_tokens:  params.maxTokens,
+      temperature: params.temperature,
+      top_p:       params.topP,
+    }),
+  });
+  if (!r.ok) throw new Error(`OpenAI error ${r.status}`);
+  return ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
+}
+
+// ── Display: Zone 3 — AI Response ────────────────────────────────────────────
+// Shows paginated AI responses on the G1 glasses.
+// Strategy: showReferenceCard(title, text) → showTextWall fallback.
+// SDK uses separate string args — NOT an object: showReferenceCard(title: string, text: string, options?)
+async function showOnGlasses(
+  session: AppSession,
+  text: string,
+  userId?: string,
+  fromSearch: boolean = false
+) {
+  if (!text?.trim()) return;
+
+  // Paginate with 5 lines/page (full G1 display real estate)
+  const contentPages = paginate(text, 44, 5);
+  const total = contentPages.length;
+
+  // Store pages in user state for button navigation
+  const userState = userId ? getState(userId) : null;
+  if (userState) {
+    userState.pages = contentPages;
+    userState.pageIndex = 0;
+  }
+
+  // ── Main paginated display loop ───────────────────────────────────────────
+  for (let i = 0; i < contentPages.length; i++) {
+    const pageNum  = i + 1;
+    const pageText = contentPages[i];
+    const isLast   = i === contentPages.length - 1;
+    const prefix   = fromSearch ? 'Search' : 'GeauxAI';
+
+    // Update page index in user state for button nav tracking
+    if (userState) userState.pageIndex = i;
+
+    // All pages: showTextWall — full-width display, confirmed working on G1.
+    // Page 0 with a stored question: prepend "Q: ..." header for context.
+    // Pages 2+: prepend "[N/Total]" page indicator.
+    // showDoubleTextWall and showReferenceCard are NOT used — both render
+    // incorrectly on the G1's 640x200 monochrome display.
+    if (i === 0 && userId) {
+      const qs = getState(userId);
+      if (qs.lastPrompt) {
+        try { await session.layouts.showTextWall(`Q: ${qs.lastPrompt}\n\n${pageText}`); } catch {}
+      } else {
+        try { await session.layouts.showTextWall(pageText); } catch {}
+      }
+    } else {
+      const header = total > 1 ? `[${prefix} ${pageNum}/${total}]\n` : '';
+      try { await session.layouts.showTextWall(header + pageText); } catch {}
+    }
+
+    if (!isLast) await sleep(PAGE_DELAY);
+  }
+
+  // ── Post-display: auto-clear timer + dashboard update ─────────────────────
+  if (userId) {
+    const s = getState(userId);
+    // If Kokoro TTS is active, speakWithKokoro handles its own auto-clear timer
+    if (s.ttsEnabled && s.ttsEngine === 'kokoro') {
+      updateDashboard(session, 'Ready', `Last: ${truncate(text, 25)}`, s.history.length);
+      return;
+    }
+    cancelAutoClearTimer(userId);
+    s.autoClearTimer = setTimeout(async () => {
+      s.autoClearTimer = null;
+      const activeSession = activeSessions.get(userId!);
+      if (activeSession) {
+        try { await activeSession.layouts.clearView(); } catch {}
+        console.log(`[AutoClear] Display cleared for ${userId}`);
+      }
+    }, AUTO_CLEAR_DELAY_MS);
+    console.log(`[AutoClear] Timer started for ${userId} (${AUTO_CLEAR_DELAY_MS}ms)`);
+    updateDashboard(session, 'Ready', `Last: ${truncate(text, 25)}`, s.history.length);
+  }
+}
+
+// ── Pagination ────────────────────────────────────────────────────────────────
+// Splits text into glasses-sized pages.
+// cpl=44: characters per line (G1 640px wide, SDK font fits ~40-46 chars)
+// lpp=5 : lines per page (G1 display fits 5 lines comfortably)
+// Handles words longer than line width without silent truncation.
+function paginate(text: string, cpl = 44, lpp = 5): string[] {
+  const words = text.split(/\s+/).filter(w => w.length > 0);
+  const lines: string[] = [];
+  let cur = '';
+
+  for (const w of words) {
+    const candidate = cur ? `${cur} ${w}` : w;
+    if (candidate.length <= cpl) {
+      cur = candidate;
+    } else {
+      if (cur) lines.push(cur);
+      if (w.length > cpl) {
+        // Break long word across multiple lines
+        let remaining = w;
+        while (remaining.length > cpl) {
+          lines.push(remaining.substring(0, cpl));
+          remaining = remaining.substring(cpl);
+        }
+        cur = remaining;
+      } else {
+        cur = w;
+      }
+    }
+  }
+  if (cur) lines.push(cur);
+
+  const pages: string[] = [];
+  for (let i = 0; i < lines.length; i += lpp) {
+    pages.push(lines.slice(i, i + lpp).join('\n'));
+  }
+  return pages.length ? pages : ['(empty)'];
+}
+
+function stripMarkdown(t: string): string {
+  return t.replace(/\*\*(.+?)\*\*/g,'$1').replace(/\*(.+?)\*/g,'$1')
+    .replace(/`(.+?)`/g,'$1').replace(/#+\s*/g,'').replace(/^[-•*]\s+/gm,'')
+    .replace(/^\d+\.\s+/gm,'').replace(/\n{3,}/g,'\n\n').trim();
+}
+
+function truncate(t: string, max: number): string {
+  return t.length <= max ? t : t.substring(0, max - 3) + '...';
+}
+
+// Truncate AI response at a natural sentence boundary for the glasses display.
+// Finds the last sentence-ending punctuation before MAX_DISPLAY_CHARS to avoid
+// cutting mid-sentence.
+function truncateForDisplay(text: string, max: number = MAX_DISPLAY_CHARS): string {
+  if (text.length <= max) return text;
+  const truncated = text.substring(0, max);
+  const lastPeriod   = truncated.lastIndexOf('.');
+  const lastQuestion = truncated.lastIndexOf('?');
+  const lastExclaim  = truncated.lastIndexOf('!');
+  const lastBreak    = Math.max(lastPeriod, lastQuestion, lastExclaim);
+  // Only use sentence boundary if it's in the second half of the truncation window
+  if (lastBreak > max * 0.5) {
+    return truncated.substring(0, lastBreak + 1);
+  }
+  return truncated.trim() + '...';
+}
+
+function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
+
+async function webSearch(query: string): Promise<string> {
+  if (!TAVILY_API_KEY || !WEB_SEARCH_ENABLED) return '';
+  try {
+    // Auto-detect topic: 'news' for current-events queries, 'general' for everything else
+    const newsSignals = /\b(news|headlines|today|breaking|war|election|president|trump|biden|congress|senate|politics|weather|stock|market|crisis|attack|bombing|killed|dead|earthquake|hurricane|tornado|flood|shooting|police|protest|iran|ukraine|russia|china|military|ceasefire|sanctions|tariff|inflation|economy|fed|rate|GDP)\b/i;
+    const searchTopic = newsSignals.test(query) ? 'news' : 'general';
+    console.log(`[Search] Topic: ${searchTopic} for: "${query.substring(0, 60)}"`);
+
+    const r = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${TAVILY_API_KEY}`,
+      },
+      body: JSON.stringify({
+        query,
+        search_depth:        'advanced',  // deeper crawl, 2 credits/search
+        include_answer:       true,        // Tavily AI-generated summary
+        include_raw_content:  false,       // keep false to control context size
+        max_results:          8,           // more sources
+        topic:               searchTopic, // auto-detected: 'news' or 'general'
+      }),
+    });
+    if (!r.ok) { console.log(`[WebSearch] Tavily error: HTTP ${r.status}`); return ''; }
+    const data = await r.json() as any;
+
+    const lines: string[] = [];
+    const now = new Date().toISOString();
+    lines.push('===WEB SEARCH RESULTS===');
+    lines.push(`Query: "${query}"`);
+    lines.push(`Date: ${now}`);
+    lines.push('');
+
+    if (data.answer && data.answer.trim()) {
+      lines.push(`Summary: ${data.answer.trim()}`);
+      lines.push('');
+    }
+
+    const results = (data.results || []).slice(0, 6);
+    results.forEach((res: any, i: number) => {
+      const title   = (res.title            || '').trim();
+      const content = (res.content          || '').trim().substring(0, 500);
+      const url     = (res.url              || '').trim();
+      const pubDate = (res.published_date   || '').trim();
+      if (title || content) {
+        lines.push(`${i + 1}. ${title}`);
+        if (pubDate) lines.push(`   Published: ${pubDate}`);
+        if (url)     lines.push(`   Source: ${url}`);
+        if (content) lines.push(`   ${content}`);
+        lines.push('');
+      }
+    });
+
+    lines.push('===END SEARCH RESULTS===');
+    lines.push(`Use these results to answer comprehensively. Today's date is ${now}. Cite sources when possible.`);
+
+    const count = results.length;
+    if (count === 0 && !data.answer) {
+      console.log(`[WebSearch] No results for: "${query}"`);
+      return '';
+    }
+    console.log(`[WebSearch] Tavily "${query}" → ${count} results` + (data.answer ? ' + summary' : ''));
+    return lines.join('\n');
+  } catch (err: any) {
+    console.log(`[WebSearch] Failed: ${err.message}`);
+    return '';
+  }
+}
+
+async function speakWithElevenLabs(session: AppSession | undefined, text: string, userId: string, voiceId?: string): Promise<void> {
+  if (!ELEVENLABS_API_KEY) return;
+  try {
+    const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
+    if (!session) {
+      console.log(`[TTS] ElevenLabs skipped — no glasses session for ${userId}`);
+      return;
+    }
+    const result = await (session.audio as any).speak(safeText, {
+      voice_id: (voiceId || ELEVENLABS_VOICE_ID) || undefined,
+      voice_settings: {
+        stability:        0.5,
+        similarity_boost: 0.75,
+        speed:            1.1,
+      },
+    });
+    if (result?.success) {
+      const durSec = typeof result.duration === 'number' ? result.duration : null;
+      console.log(`[TTS] ElevenLabs spoke ${safeText.length} chars (${durSec ?? '?'}s) for ${userId}`);
+    } else {
+      console.log(`[TTS] ElevenLabs failed: ${result?.error ?? 'unknown error'}`);
+    }
+  } catch (err: any) {
+    console.log(`[TTS] ElevenLabs error: ${err.message}`);
+  }
+}
+
+async function speakWithKokoro(userId: string, text: string, voiceOverride?: string): Promise<void> {
+  try {
+    const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
+    const r = await fetch(`${KOKORO_HOST}/v1/audio/speech`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'kokoro',
+        input: safeText,
+        voice: (voiceOverride || KOKORO_VOICE) || 'af_bella',
+        response_format: 'mp3',
+        speed: 1.0,
+      }),
+    });
+    if (!r.ok) {
+      console.log(`[TTS] Kokoro error ${r.status}`);
+      return;
+    }
+    const audioBuffer = Buffer.from(await r.arrayBuffer());
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    audioCache.set(id, { buf: audioBuffer, expires: Date.now() + 300_000 });
+    const audioUrl = `/tts-audio/${id}`;
+    broadcastToUser(userId, 'tts_audio', { url: audioUrl });
+    console.log(`[TTS] Kokoro → SSE audio push (${safeText.length} chars, voice: ${voiceOverride || KOKORO_VOICE})`);
+    cancelAutoClearTimer(userId);
+    const ks = getState(userId);
+    ks.autoClearTimer = setTimeout(async () => {
+      ks.autoClearTimer = null;
+      const kSession = activeSessions.get(userId);
+      if (kSession) {
+        try { await kSession.layouts.clearView(); } catch {}
+        updateDashboard(kSession, 'Ready');
+        console.log(`[AutoClear] Display cleared for ${userId}`);
+      }
+    }, AUTO_CLEAR_DELAY_MS);
+    console.log(`[AutoClear] Timer started for ${userId} (${AUTO_CLEAR_DELAY_MS}ms) [post-Kokoro]`);
+  } catch (err: any) {
+    console.log(`[TTS] Kokoro failed: ${err.message}`);
+  }
+}
+
+function detectSearchIntent(prompt: string): boolean {
+  const p = prompt.toLowerCase();
+  const signals = [
+    // Time/recency
+    'today','tonight','right now','current','currently','latest','recent',
+    'recently','this week','this month','this year','just happened',
+    'breaking','live','now','last night','yesterday',
+    'just announced','just released','just launched','new update','update on',
+    // Questions needing live data
+    'what is the weather','weather in','weather for',
+    'what is the score','who won',"what's the score",
+    'what happened','who is the current','who is the new',
+    'what is the latest',"what's happening",'whats happening',
+    'is there a','did they announce','has it been released',
+    "what's the price",'how much does','how much is',"what's the stock",
+    'stock price','market today',
+    'who is the president','who is the ceo','who is the',
+    'what time does','when does','when did','when is',
+    'is it open','are they open','hours for',
+    'how do i get to','directions to','near me',
+    'best rated','reviews for','rating of',
+    // Explicit search requests
+    'search for','look up','find out','google',
+    'search the web','look it up','can you find',
+    'what does the internet say','find me',
+    // News and events
+    'news','score','scores','election','results',
+    'announcement','release date','coming out',
+    'box office','standings','rankings','leaderboard',
+    'championship','playoffs','season','episode',
+    'trailer','review',
+  ];
+  return signals.some(s => p.includes(s));
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+// Validate required env vars before starting
+if (!API_KEY) {
+  console.error('\n❌  MENTRA_API_KEY is not set in your .env file.\n');
+  process.exit(1);
+}
+if (!OWNER_EMAIL) {
+  console.warn('\n⚠️   OWNER_EMAIL is not set. Webview will require a valid MentraOS auth token.');
+  console.warn('    Set OWNER_EMAIL=your@email.com in .env for local dev fallback.\n');
+}
+
+const server = new GeauxAIApp({ packageName: PACKAGE_NAME, apiKey: API_KEY, port: PORT });
+server.addRoutes();
+server.start();
+
+console.log('');
+console.log('════════════════════════════════════════════');
+console.log('  GeauxAI Labs — GeauxAiPrompt  (MentraOS)');
+console.log('════════════════════════════════════════════');
+console.log(`  Package : ${PACKAGE_NAME}`);
+console.log(`  Port    : ${PORT}`);
+console.log(`  AI      : ${AI_PROVIDER} / ${AI_MODEL}`);
+console.log(`  Search  : ${TAVILY_API_KEY ? 'Tavily (live web)' : 'DISABLED — set TAVILY_API_KEY in .env'}`);
+console.log(`  CloudAI : ${CF_API_TOKEN ? 'Cloudflare Workers AI (enabled)' : 'DISABLED — set CF_ACCOUNT_ID & CF_API_TOKEN in .env'}`);
+console.log(`  TTS     : ${ELEVENLABS_API_KEY ? 'ElevenLabs (voice enabled)' : 'DISABLED — set ELEVENLABS_API_KEY in .env'}`);
+console.log(`  Kokoro  : ${KOKORO_HOST} (voice: ${KOKORO_VOICE})`);
+console.log(`  Mode    : VOICE ALWAYS ON + LIVE CHAT LOG`);
+console.log(`  Method  : SSE real-time push`);
+console.log(`  AI Tools: ask_geauxai, web_search (Mira integration)`);
+console.log('════════════════════════════════════════════');
+console.log('');
