@@ -41,6 +41,8 @@ interface GenParams {
   webSearch:    boolean;
   useCloudflare: boolean;
   elevenLabsVoiceId: string;
+  kokoroVoice: string;
+  avatarEnabled: boolean;
 }
 
 interface UserState {
@@ -83,9 +85,12 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   webSearch:    true,
   useCloudflare: false,
   elevenLabsVoiceId: '',
+  kokoroVoice: '',
+  avatarEnabled: true,
 };
 
 DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
+DEFAULT_GEN_PARAMS.kokoroVoice = KOKORO_VOICE;
 
 const CF_MODELS: string[] = [
   '@cf/nvidia/nemotron-3-120b-a12b',
@@ -501,6 +506,26 @@ kbd{
 .ft-prev-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .ft-prev-rm{background:none;border:none;cursor:pointer;color:var(--tx3);font-size:14px;padding:2px 4px;}
 .ft-prev-rm:hover{color:var(--r)}
+/* ── TTS Avatar ─────────────────────────────────────────────────────────── */
+#tts-avatar{
+  width:100%;height:100%;
+  filter:drop-shadow(0 0 24px #7c3aedbb);
+}
+#tts-avatar.visible{display:block}
+#av-close{
+  position:absolute;top:-8px;right:-8px;
+  width:22px;height:22px;border-radius:50%;
+  background:#1a1630;border:1px solid #7c3aed88;
+  color:#c4b5fd;font-size:11px;line-height:22px;text-align:center;
+  cursor:pointer;pointer-events:all;
+  font-family:var(--mono);font-weight:700;
+  display:none;
+  z-index:2;
+}
+#av-wrap.draggable{cursor:grab}
+#av-wrap.dragging{cursor:grabbing}
+#tts-avatar.visible + #av-close,
+#av-close.visible{display:block}
 </style>
 
 <script>
@@ -677,6 +702,11 @@ kbd{
   <span class="p-lbl">ELEVENLABS VOICE <span class="p-hint">— voice used when ELEVEN engine is selected</span></span>
   <select class="p-sel" id="p-eleven-voice"><option value="">Default (from .env)</option></select>
 </div>` : ''}
+    ${KOKORO_HOST ? `
+<div class="p-row" id="p-row-kokoro-voice">
+  <span class="p-lbl">KOKORO VOICE <span class="p-hint">— voice used when KOKORO engine is selected. Supports blending: af_bella+af_sky</span></span>
+  <select class="p-sel" id="p-kokoro-voice"><option value="">Default (from .env)</option></select>
+</div>` : ''}
     <div class="p-row">
       <span class="p-lbl">AI PROVIDER <span class="p-hint">— switch between local Ollama and Cloudflare cloud AI</span></span>
       <div class="p-tog-row">
@@ -689,6 +719,13 @@ kbd{
       <div class="p-tog-row">
         <label class="tsw"><input type="checkbox" id="p-ws"><span class="ttrack"></span></label>
         <span class="thint" id="p-ws-hint">OFF — model knowledge only</span>
+      </div>
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">TTS AVATAR <span class="p-hint">— show/hide the floating avatar during TTS playback</span></span>
+      <div class="p-tog-row">
+        <label class="tsw"><input type="checkbox" id="p-avatar" checked><span class="ttrack"></span></label>
+        <span class="thint" id="p-avatar-hint">ON — avatar appears during speech</span>
       </div>
     </div>
     <div class="p-row">
@@ -716,6 +753,40 @@ kbd{
   <img class="ft-prev-img" id="ft-prev-img" src="" alt="" style="display:none">
   <span class="ft-prev-name" id="ft-prev-name"></span>
   <button class="ft-prev-rm" id="ft-prev-rm" title="Remove file">✕</button>
+</div>
+<!-- TTS avatar -->
+<div id="av-wrap" style="position:fixed;bottom:90px;right:14px;z-index:100;width:306px;height:306px;display:none;pointer-events:all;">
+  <svg id="tts-avatar" viewBox="0 0 72 72" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:100%">
+  <defs>
+    <radialGradient id="faceGrad" cx="50%" cy="45%" r="50%">
+      <stop offset="0%" stop-color="#2d1a4a"/>
+      <stop offset="100%" stop-color="#110e24"/>
+    </radialGradient>
+  </defs>
+  <circle cx="36" cy="36" r="34" fill="url(#faceGrad)"
+    stroke="#7c3aed" stroke-width="1.5" stroke-opacity=".6"/>
+  <ellipse cx="25" cy="29" rx="4" ry="4.5" fill="#1a0e38"/>
+  <ellipse id="av-pupil-l" cx="25" cy="29" rx="2.5" ry="3" fill="#a855f7" opacity=".9"/>
+  <ellipse cx="47" cy="29" rx="4" ry="4.5" fill="#1a0e38"/>
+  <ellipse id="av-pupil-r" cx="47" cy="29" rx="2.5" ry="3" fill="#a855f7" opacity=".9"/>
+  <circle cx="26.5" cy="27.5" r="1" fill="#c4b5fd" opacity=".8"/>
+  <circle cx="48.5" cy="27.5" r="1" fill="#c4b5fd" opacity=".8"/>
+  <!-- Eyelids — ry animated to 4.5 (closed) or 0 (open) via JS -->
+  <ellipse id="av-lid-l" cx="25" cy="29" rx="4.2" ry="0"
+    fill="#110e24"/>
+  <ellipse id="av-lid-r" cx="47" cy="29" rx="4.2" ry="0"
+    fill="#110e24"/>
+  <circle cx="36" cy="37" r="1.2" fill="#7c3aed" opacity=".35"/>
+  <ellipse id="av-mouth" cx="36" cy="47" rx="7" ry="1.2"
+    fill="#0d0920" stroke="#a855f7" stroke-width="1.3"/>
+  <circle cx="36" cy="36" r="34" fill="none"
+    stroke="#7c3aed" stroke-width=".8" stroke-opacity=".25"
+    stroke-dasharray="4 7">
+    <animateTransform attributeName="transform" type="rotate"
+      from="0 36 36" to="360 36 36" dur="14s" repeatCount="indefinite"/>
+  </circle>
+</svg>
+  <div id="av-close" onclick="window._avClose && window._avClose()">✕</div>
 </div>
 <footer class="ft">
   <input type="file" id="ft-file" accept="image/*,audio/*,.pdf,.txt" style="display:none">
@@ -751,6 +822,8 @@ kbd{
     var ws=document.getElementById('p-ws');
     var cf=document.getElementById('p-cf');
     var elevVoiceEl=document.getElementById('p-eleven-voice');
+    var kokoroVoiceEl=document.getElementById('p-kokoro-voice');
+    var avatarEl=document.getElementById('p-avatar');
     if(!sys||!temp||!topp||!mt) return;
     fetch('/api/params'+authQ,{
       method:'POST',headers:{'Content-Type':'application/json'},
@@ -759,7 +832,9 @@ kbd{
         topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
         model:mdl?mdl.value:'',webSearch:ws?ws.checked:true,
         useCloudflare:cf?cf.checked:false,
-        elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:''
+        elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
+        kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
+        ,avatarEnabled:avatarEl?!!avatarEl.checked:true
       })
     }).catch(function(){});
   }
@@ -799,9 +874,27 @@ kbd{
         });
       }).catch(function(){});
   }
+  function refreshKokoroVoices(selectedId) {
+    fetch('/api/kokoro-voices' + authQ)
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d || !d.voices) return;
+        var sel = document.getElementById('p-kokoro-voice');
+        if (!sel) return;
+        while (sel.options.length > 1) sel.remove(1);
+        d.voices.forEach(function(v){
+          var opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = v;
+          if (selectedId && v === selectedId) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      }).catch(function(){});
+  }
   // Initial load
   refreshModels('ollama');
   refreshElevenVoices();
+  refreshKokoroVoices();
 
   fetch('/api/params'+authQ)
     .then(function(r){return r.ok?r.json():null;})
@@ -834,6 +927,13 @@ kbd{
         refreshModels(d.useCloudflare?'cloudflare':'ollama');
       }
       refreshElevenVoices(d.elevenLabsVoiceId || '');
+      refreshKokoroVoices(d.kokoroVoice || '');
+      var avatarEl=document.getElementById('p-avatar');
+      var avatarHint=document.getElementById('p-avatar-hint');
+      if(avatarEl&&d.avatarEnabled!==undefined){
+        avatarEl.checked=!!d.avatarEnabled;
+        if(avatarHint) avatarHint.textContent=d.avatarEnabled?'ON — avatar appears during speech':'OFF — avatar hidden';
+      }
     }).catch(function(){});
 
   var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
@@ -873,6 +973,15 @@ kbd{
   if(sysEl){sysEl.addEventListener('blur',sendParams);sysEl.addEventListener('input',dSend);}
   var elevVoiceEl = document.getElementById('p-eleven-voice');
   if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
+  var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
+  if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
+  var avTogEl=document.getElementById('p-avatar');
+  var avTogHint=document.getElementById('p-avatar-hint');
+  if(avTogEl) avTogEl.addEventListener('change',function(){
+    var on=avTogEl.checked;
+    if(avTogHint) avTogHint.textContent=on?'ON — avatar appears during speech':'OFF — avatar hidden';
+    fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({avatarEnabled:on})}).catch(function(){});
+  });
 
   window.toggleTTSEngine=function(){
     fetch('/tts-engine'+authQ,{method:'POST'})
@@ -999,6 +1108,419 @@ kbd{
   if(feed) feed.scrollTop=feed.scrollHeight;
 })();
 </script>
+<script>
+  /* ── TTS Avatar ─────────────────────────────────────────────────────── */
+  (function(){
+    var wrap   = document.getElementById('av-wrap');
+    var avatar = document.getElementById('tts-avatar');
+    var mouth  = document.getElementById('av-mouth');
+    var closeBtn = document.getElementById('av-close');
+    if (!wrap || !avatar || !mouth) return;
+
+    var audioCtx  = null;
+    var analyser  = null;
+    var dataArr   = null;
+    var rafId     = null;
+    var simAnim   = null;
+
+    // Eye animation state
+    var lidL = null;
+    var lidR = null;
+    var pupL = null;
+    var pupR = null;
+    var eyeAnimId = null;   // RAF for pupil drift during speaking
+    var blinkTimer = null;  // setTimeout chain for random blinks
+    var isSpeaking = false; // true while avatar is showing + animating
+
+    initEyes();
+
+    // ── Drag to move ───────────────────────────────────────────────
+    // On first drag we switch from bottom/right to top/left coords
+    // so JS can freely reposition the wrapper.
+    var dragging    = false;
+    var dragOffX    = 0;
+    var dragOffY    = 0;
+    var dragAnchored = true; // true = still using bottom/right CSS
+
+    // ── Float state ───────────────────────────────────────────────────────────
+    var floatRafId  = null;   // requestAnimationFrame id for float loop
+    var floatT      = 0;      // time counter driving the sine paths
+    var floatBaseX  = 0;      // current base left position (px)
+    var floatBaseY  = 0;      // current base top position (px)
+    var floatVX     = 0;      // slow drift velocity X (px/frame)
+    var floatVY     = 0;      // slow drift velocity Y (px/frame)
+    var floatDirTimer = null; // timer to pick new drift direction
+
+    function toTopLeft() {
+      if (!dragAnchored) return;
+      // Convert current bottom/right position to top/left
+      var rect = wrap.getBoundingClientRect();
+      wrap.style.top    = rect.top  + 'px';
+      wrap.style.left   = rect.left + 'px';
+      wrap.style.bottom = 'auto';
+      wrap.style.right  = 'auto';
+      dragAnchored = false;
+    }
+
+    function onDragStart(clientX, clientY) {
+      // Don't start drag if clicking the close button
+      if (closeBtn && closeBtn.contains(document.elementFromPoint(clientX, clientY))) return;
+      toTopLeft();
+      dragging = true;
+      var rect = wrap.getBoundingClientRect();
+      dragOffX = clientX - rect.left;
+      dragOffY = clientY - rect.top;
+      wrap.classList.add('dragging');
+      wrap.classList.remove('draggable');
+    }
+
+    function onDragMove(clientX, clientY) {
+      if (!dragging) return;
+      var newLeft = clientX - dragOffX;
+      var newTop  = clientY - dragOffY;
+      // Clamp within viewport with 10px margin
+      var maxLeft = window.innerWidth  - wrap.offsetWidth  - 10;
+      var maxTop  = window.innerHeight - wrap.offsetHeight - 10;
+      newLeft = Math.max(10, Math.min(newLeft, maxLeft));
+      newTop  = Math.max(10, Math.min(newTop,  maxTop));
+      wrap.style.left = newLeft + 'px';
+      wrap.style.top  = newTop  + 'px';
+    }
+
+    function onDragEnd() {
+      if (!dragging) return;
+      dragging = false;
+      wrap.classList.remove('dragging');
+      wrap.classList.add('draggable');
+      // Re-seed float base position from drop location
+      // so float resumes from where the user left it
+      var rect   = wrap.getBoundingClientRect();
+      floatBaseX = rect.left;
+      floatBaseY = rect.top;
+    }
+
+    // Mouse events
+    wrap.addEventListener('mousedown', function(e) {
+      onDragStart(e.clientX, e.clientY);
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+      onDragMove(e.clientX, e.clientY);
+    });
+    document.addEventListener('mouseup', function() {
+      onDragEnd();
+    });
+
+    // Touch events (mobile webview)
+    wrap.addEventListener('touchstart', function(e) {
+      var t = e.touches[0];
+      onDragStart(t.clientX, t.clientY);
+    }, { passive: true });
+    document.addEventListener('touchmove', function(e) {
+      if (!dragging) return;
+      var t = e.touches[0];
+      onDragMove(t.clientX, t.clientY);
+      e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchend', function() {
+      onDragEnd();
+    });
+
+    // Add initial draggable class so cursor shows on hover
+    wrap.classList.add('draggable');
+    // ── End drag ─────────────────────────────────────────────────────
+
+    // ── Float ─────────────────────────────────────────────────────
+    function pickNewFloatDir() {
+      // Pick a new slow drift direction every 3-6 seconds
+      var angle = Math.random() * Math.PI * 2;
+      var speed = 0.18 + Math.random() * 0.14; // 0.18-0.32 px/frame
+      floatVX = Math.cos(angle) * speed;
+      floatVY = Math.sin(angle) * speed;
+      floatDirTimer = setTimeout(pickNewFloatDir, 3000 + Math.random() * 3000);
+    }
+
+    function floatTick() {
+      if (!dragging) {
+        var w = wrap.offsetWidth  || 306;
+        var h = wrap.offsetHeight || 306;
+        var maxX = window.innerWidth  - w - 10;
+        var maxY = window.innerHeight - h - 10;
+
+        // Advance base position by velocity
+        floatBaseX += floatVX;
+        floatBaseY += floatVY;
+
+        // Add a gentle sine wobble on top of the drift
+        floatT += 0.012;
+        var wobbleX = Math.sin(floatT * 1.3) * 1.8;
+        var wobbleY = Math.cos(floatT)        * 1.4;
+
+        var newLeft = floatBaseX + wobbleX;
+        var newTop  = floatBaseY + wobbleY;
+
+        // Bounce off edges — reverse velocity component on hit
+        if (newLeft < 10)     { newLeft = 10;   floatVX =  Math.abs(floatVX); floatBaseX = 10; }
+        if (newLeft > maxX)   { newLeft = maxX; floatVX = -Math.abs(floatVX); floatBaseX = maxX; }
+        if (newTop  < 10)     { newTop  = 10;   floatVY =  Math.abs(floatVY); floatBaseY = 10; }
+        if (newTop  > maxY)   { newTop  = maxY; floatVY = -Math.abs(floatVY); floatBaseY = maxY; }
+
+        wrap.style.left = newLeft.toFixed(1) + 'px';
+        wrap.style.top  = newTop.toFixed(1)  + 'px';
+      }
+      floatRafId = requestAnimationFrame(floatTick);
+    }
+
+    function startFloat() {
+      // Convert to top/left coords if still using bottom/right
+      toTopLeft();
+      // Seed base position from current rendered position
+      var rect   = wrap.getBoundingClientRect();
+      floatBaseX = rect.left;
+      floatBaseY = rect.top;
+      // Start with a gentle random direction
+      pickNewFloatDir();
+      if (!floatRafId) floatRafId = requestAnimationFrame(floatTick);
+    }
+
+    function stopFloat() {
+      if (floatRafId) { cancelAnimationFrame(floatRafId); floatRafId = null; }
+      if (floatDirTimer) { clearTimeout(floatDirTimer); floatDirTimer = null; }
+    }
+    // ── End float ─────────────────────────────────────────────────
+
+    // ── Eye helpers ───────────────────────────────────────────────
+    function initEyes() {
+      lidL = document.getElementById('av-lid-l');
+      lidR = document.getElementById('av-lid-r');
+      pupL = document.getElementById('av-pupil-l');
+      pupR = document.getElementById('av-pupil-r');
+    }
+
+    function blink() {
+      if (!lidL || !lidR) return;
+      // Close lids over 60ms, hold 40ms, open over 60ms
+      lidL.setAttribute('ry', '4.5');
+      lidR.setAttribute('ry', '4.5');
+      setTimeout(function() {
+        lidL.setAttribute('ry', '0');
+        lidR.setAttribute('ry', '0');
+      }, 100);
+      // Schedule next blink randomly 2-5 seconds away
+      blinkTimer = setTimeout(blink, 2000 + Math.random() * 3000);
+    }
+
+    function startBlink() {
+      if (blinkTimer) return;
+      // Small initial delay so first blink feels natural
+      blinkTimer = setTimeout(blink, 800 + Math.random() * 1500);
+    }
+
+    function stopBlink() {
+      if (blinkTimer) { clearTimeout(blinkTimer); blinkTimer = null; }
+      if (lidL) lidL.setAttribute('ry', '0');
+      if (lidR) lidR.setAttribute('ry', '0');
+    }
+
+    // Pupil drift — slow random movement while speaking
+    // Pupils wander within a 2px radius of center then drift back
+    var pupilTargetX = 0;
+    var pupilTargetY = 0;
+    var pupilCurX = 0;
+    var pupilCurY = 0;
+    var pupilDriftFrames = 0;
+    var pupilDriftTarget = 30;
+
+    function tickPupils() {
+      if (!pupL || !pupR || !isSpeaking) return;
+      pupilDriftFrames++;
+      if (pupilDriftFrames >= pupilDriftTarget) {
+        // Pick a new wander target within ±2 units of eye center
+        pupilTargetX = (Math.random() - 0.5) * 3.5;
+        pupilTargetY = (Math.random() - 0.5) * 2;
+        pupilDriftTarget = 20 + Math.floor(Math.random() * 40);
+        pupilDriftFrames = 0;
+      }
+      // Ease toward target (lerp factor 0.06 = slow drift)
+      pupilCurX += (pupilTargetX - pupilCurX) * 0.06;
+      pupilCurY += (pupilTargetY - pupilCurY) * 0.06;
+      pupL.setAttribute('cx', (25 + pupilCurX).toFixed(2));
+      pupL.setAttribute('cy', (29 + pupilCurY).toFixed(2));
+      pupR.setAttribute('cx', (47 + pupilCurX).toFixed(2));
+      pupR.setAttribute('cy', (29 + pupilCurY).toFixed(2));
+      eyeAnimId = requestAnimationFrame(tickPupils);
+    }
+
+    function startEyeAnim() {
+      isSpeaking = true;
+      startBlink();
+      if (!eyeAnimId) eyeAnimId = requestAnimationFrame(tickPupils);
+    }
+
+    function stopEyeAnim() {
+      isSpeaking = false;
+      stopBlink();
+      if (eyeAnimId) { cancelAnimationFrame(eyeAnimId); eyeAnimId = null; }
+      // Return pupils to center
+      if (pupL) { pupL.setAttribute('cx', '25'); pupL.setAttribute('cy', '29'); }
+      if (pupR) { pupR.setAttribute('cx', '47'); pupR.setAttribute('cy', '29'); }
+      pupilCurX = 0; pupilCurY = 0;
+      pupilTargetX = 0; pupilTargetY = 0;
+    }
+    // ── End eye helpers ───────────────────────────────────────────
+
+    function initCtx(audioEl) {
+      if (audioCtx) return;
+      try {
+        audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+        analyser  = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        dataArr   = new Uint8Array(analyser.frequencyBinCount);
+        var src   = audioCtx.createMediaElementSource(audioEl);
+        src.connect(analyser);
+        analyser.connect(audioCtx.destination);
+      } catch(e) { audioCtx = null; }
+    }
+
+    function getRMS() {
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(dataArr);
+      var sum = 0;
+      for (var i = 0; i < dataArr.length; i++) {
+        var v = (dataArr[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / dataArr.length);
+    }
+
+    function tick() {
+      var ry = Math.min(6, Math.max(1.2, getRMS() * 22));
+      mouth.setAttribute('ry', ry.toFixed(1));
+      rafId = requestAnimationFrame(tick);
+    }
+
+    function stopSimAnim() {
+      if (simAnim) { clearInterval(simAnim); simAnim = null; }
+    }
+
+    function showAvatar(audioEl) {
+      var _avPref = document.getElementById('p-avatar');
+      if (_avPref && !_avPref.checked) return;
+      if (audioEl) {
+        stopSimAnim();
+        initCtx(audioEl);
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        if (!rafId) rafId = requestAnimationFrame(tick);
+      } else {
+        if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+        stopSimAnim();
+        var speechState = 0;
+        var stateFrames = 0;
+        var stateTarget = 3;
+        simAnim = setInterval(function() {
+          stateFrames++;
+          if (stateFrames >= stateTarget) {
+            var r = Math.random();
+            if (r < 0.12)      { speechState = 0; stateTarget = 2 + Math.floor(Math.random() * 4); }
+            else if (r < 0.35) { speechState = 3; stateTarget = 1 + Math.floor(Math.random() * 3); }
+            else if (r < 0.65) { speechState = 1; stateTarget = 2 + Math.floor(Math.random() * 4); }
+            else               { speechState = 2; stateTarget = 2 + Math.floor(Math.random() * 5); }
+            stateFrames = 0;
+          }
+          var baseRy;
+          if      (speechState === 0) baseRy = 1.2;
+          else if (speechState === 1) baseRy = 3.0;
+          else if (speechState === 2) baseRy = 5.2;
+          else                        baseRy = 1.8;
+          var jitter = (Math.random() - 0.5) * 0.6;
+          var ry = Math.min(6, Math.max(1.2, baseRy + jitter));
+          mouth.setAttribute('ry', ry.toFixed(1));
+        }, 65);
+      }
+      wrap.style.display = 'block';
+      if (closeBtn) closeBtn.style.display = 'block';
+      startEyeAnim();
+      startFloat();
+    }
+
+    function hideAvatar() {
+      stopSimAnim();
+      wrap.style.display = 'none';
+      if (closeBtn) closeBtn.style.display = 'none';
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      mouth.setAttribute('ry', '1.2');
+      stopEyeAnim();
+      stopFloat();
+    }
+
+    function restMouth() {
+      stopSimAnim();
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      mouth.setAttribute('ry', '1.2');
+      stopEyeAnim();
+      // Restart idle blink while avatar stays visible after speaking
+      startBlink();
+    }
+
+    // Close button handler
+    window._avClose = hideAvatar;
+
+    // ── Kokoro path ───────────────────────────────────────────────────
+    function hookPlayer(el) {
+      if (el._avHooked) return;
+      el._avHooked = true;
+      el.addEventListener('play',  function(){ showAvatar(el); });
+      el.addEventListener('pause', function(){ hideAvatar(); });
+      el.addEventListener('ended', function(){ hideAvatar(); });
+    }
+
+    var existing = document.getElementById('_kplayer');
+    if (existing) hookPlayer(existing);
+
+    new MutationObserver(function(muts) {
+      for (var i = 0; i < muts.length; i++) {
+        var nodes = muts[i].addedNodes;
+        for (var j = 0; j < nodes.length; j++) {
+          if (nodes[j].id === '_kplayer') hookPlayer(nodes[j]);
+        }
+      }
+    }).observe(document.body, { childList: true });
+
+    // ── ElevenLabs path ───────────────────────────────────────────────
+    (function(){
+      var sp2 = new URLSearchParams(window.location.search);
+      var tok2 = sp2.get('token') || sp2.get('t') || '';
+      var authQ2 = tok2 ? ('?' + (sp2.get('token') ? 'token' : 't') + '=' + encodeURIComponent(tok2)) : '';
+      var restTimer = null;
+      try {
+        var es2 = new EventSource('/api/stream' + authQ2);
+        es2.addEventListener('tts_start', function(e) {
+          try {
+            var d = JSON.parse(e.data);
+            if (d.engine === 'elevenlabs') {
+              clearTimeout(restTimer);
+              showAvatar(null);
+              // Use server-estimated duration to stop mouth animation.
+              // estimatedMs already includes BLE + hardware drain buffer.
+              var ms = (d.estimatedMs && d.estimatedMs > 0) ? d.estimatedMs : 12000;
+              restTimer = setTimeout(restMouth, ms);
+            }
+          } catch(ex) {}
+        });
+        // Auto-hide avatar when next prompt starts processing
+        es2.addEventListener('state', function(e) {
+          try {
+            var d = JSON.parse(e.data);
+            if (d.processing === true && wrap.style.display === 'block') {
+              clearTimeout(restTimer);
+              hideAvatar();
+            }
+          } catch(ex) {}
+        });
+      } catch(ex) {}
+    })();
+  })();
+  </script>
 </body>
 </html>`;
 }
@@ -1402,8 +1924,7 @@ class GeauxAIApp extends AppServer {
       const userId = resolveUser(req);
       const session = activeSessions.get(userId);
       if (!session) {
-        console.log(`[TypePrompt] No active glasses session for ${userId} — ignored`);
-        return res.redirect(303, '/webview');
+        console.log(`[TypePrompt] No active glasses session for ${userId} — processing as web-only`);
       }
       const s = getState(userId);
       // -- Per-user rate limiting --------------------------------------------
@@ -1423,7 +1944,7 @@ class GeauxAIApp extends AppServer {
       }
       console.log(`[TypePrompt] ${userId} "${text.substring(0, 60)}"`);
       getState(userId).pendingRefresh = true;
-      handlePrompt(userId, text, session);     // fire-and-forget
+      handlePrompt(userId, text, session as AppSession);     // fire-and-forget
       res.redirect(303, '/webview');
     });
 
@@ -1432,7 +1953,7 @@ class GeauxAIApp extends AppServer {
       const userId = resolveUser(req);
       const session = activeSessions.get(userId);
       if (!session) {
-        return res.status(400).json({ error: 'No active glasses session.' });
+        console.log(`[Upload] No active glasses session for ${userId} — processing as web-only`);
       }
 
       const text = (req.body?.text || '').trim();
@@ -1597,6 +2118,10 @@ class GeauxAIApp extends AppServer {
         s.genParams.useCloudflare = b.useCloudflare;
       if (typeof b.elevenLabsVoiceId === 'string')
         s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
+      if (typeof b.kokoroVoice === 'string')
+        s.genParams.kokoroVoice = b.kokoroVoice;
+      if (typeof b.avatarEnabled === 'boolean')
+        s.genParams.avatarEnabled = b.avatarEnabled;
       console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
       const sess = activeSessions.get(userId);
       if (sess) {
@@ -1624,6 +2149,21 @@ class GeauxAIApp extends AppServer {
         res.json({ models, default: AI_MODEL });
       } catch {
         res.json({ models: [], default: AI_MODEL });
+      }
+    });
+
+    // GET /api/kokoro-voices — fetches available voices from local Kokoro instance
+    app.get('/api/kokoro-voices', async (_req: any, res: any) => {
+      try {
+        const r = await fetch(`${KOKORO_HOST}/v1/audio/voices`);
+        if (!r.ok) throw new Error(`Kokoro voices error ${r.status}`);
+        const data = (await r.json()) as any;
+        // Kokoro returns { voices: ["af_bella", "af_sky", ...] }
+        const voices: string[] = Array.isArray(data.voices) ? data.voices : [];
+        res.json({ voices });
+      } catch {
+        // Return empty list if Kokoro is not running or unreachable
+        res.json({ voices: [] });
       }
     });
 
@@ -1750,6 +2290,8 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
       if (prefs.genParams.model)                           s.genParams.model        = prefs.genParams.model;
       if (typeof prefs.genParams.useCloudflare === 'boolean') s.genParams.useCloudflare = prefs.genParams.useCloudflare;
       if (typeof prefs.genParams.elevenLabsVoiceId === 'string') s.genParams.elevenLabsVoiceId = prefs.genParams.elevenLabsVoiceId;
+      if (typeof prefs.genParams.kokoroVoice === 'string') s.genParams.kokoroVoice = prefs.genParams.kokoroVoice;
+      if (typeof prefs.genParams.avatarEnabled === 'boolean') s.genParams.avatarEnabled = prefs.genParams.avatarEnabled;
     }
     console.log(`[Storage] Loaded prefs for ${userId}: tts=${s.ttsEnabled} engine=${s.ttsEngine} mic=${s.micMuted ? 'off' : 'on'}`);
   } catch (err: any) {
@@ -1757,7 +2299,7 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
   }
 }
 
-async function handlePrompt(userId: string, prompt: string, session: AppSession) {
+async function handlePrompt(userId: string, prompt: string, session: AppSession | undefined) {
   const state = getState(userId);
   if (state.isProcessing) {
     console.log(`[Busy] Dropped prompt for ${userId}: still processing`);
@@ -1769,7 +2311,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
   broadcastToUser(userId, 'state', { processing: true, searching: false, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
 
   // Update dashboard: thinking
-  updateDashboard(session, 'Thinking...', truncate(prompt, 30), state.history.length);
+  if (session) updateDashboard(session, 'Thinking...', truncate(prompt, 30), state.history.length);
   console.log(`[Prompt] "${prompt.substring(0, 60)}"`);
 
   try {
@@ -1777,17 +2319,17 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     const shouldSearch = WEB_SEARCH_ENABLED && state.genParams.webSearch && detectSearchIntent(prompt);
     if (shouldSearch) {
       const searchPreview = truncate(prompt, 45);
-      try { await session.layouts.showTextWall(`Q: ${searchPreview}\n\n🔍 Searching...`); } catch {}
+      try { await session?.layouts.showTextWall(`Q: ${searchPreview}\n\n🔍 Searching...`); } catch {}
       broadcastToUser(userId, 'state', { processing: true, searching: true, micMuted: state.micMuted, ttsEnabled: state.ttsEnabled, ttsEngine: state.ttsEngine, connected: activeSessions.has(userId), reload: false });
       // Update dashboard: searching
-      updateDashboard(session, 'Searching...', truncate(prompt, 30), state.history.length);
+      if (session) updateDashboard(session, 'Searching...', truncate(prompt, 30), state.history.length);
       console.log(`[Search] Triggered for: "${prompt.substring(0, 60)}"`);
       searchContext = await webSearch(prompt);
     }
 
     // Show thinking indicator (replaces search indicator if search ran)
     const thinkPreview = truncate(prompt, 45);
-    try { await session.layouts.showTextWall(`Q: ${thinkPreview}\n\nThinking...`); } catch {}
+    try { await session?.layouts.showTextWall(`Q: ${thinkPreview}\n\nThinking...`); } catch {}
 
     state.history.push({ role: 'user', content: prompt });
     // Trim history to prevent context overflow before sending to AI
@@ -1837,19 +2379,28 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession)
     // Both engines are fire-and-forget; neither blocks the display loop.
     if (state.ttsEnabled) {
       if (state.ttsEngine === 'kokoro') {
-        speakWithKokoro(userId, clean).catch(() => {});
+        speakWithKokoro(userId, clean, state.genParams.kokoroVoice || undefined).catch(() => {});
       } else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
         speakWithElevenLabs(session, clean, userId, state.genParams.elevenLabsVoiceId).catch(() => {});
+        // Estimate audio duration from character count.
+        // ElevenLabs at speed 1.1 ≈ 13 chars/sec. Add 2.5s buffer for
+        // BLE transmission and speaker hardware drain.
+        const elevenEstMs = Math.round((clean.length / 13) * 1000) + 2500;
+        // Delay tts_start so the reloaded page has time to re-establish
+        // its SSE connection before the avatar trigger arrives.
+        setTimeout(() => {
+          broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
+        }, 1200);
       }
     }
 
     // Apply display truncation at sentence boundary before showing on glasses
     const displayText = truncateForDisplay(clean);
-    await showOnGlasses(session, displayText, userId, !!searchContext);
+    if (session) await showOnGlasses(session, displayText, userId, !!searchContext);
   } catch (err: any) {
     console.error(`[Error]`, err.message);
-    try { await session.layouts.showTextWall('GeauxAI error\n\n' + truncate(err.message, 80)); } catch {}
-    updateDashboard(session, 'Error', truncate(err.message, 30));
+    try { await session?.layouts.showTextWall('GeauxAI error\n\n' + truncate(err.message, 80)); } catch {}
+    if (session) updateDashboard(session, 'Error', truncate(err.message, 30));
     if (state.history.length && state.history[state.history.length - 1].role === 'user') state.history.pop();
     state.isProcessing  = false;
     state.pendingRefresh = false;
@@ -2014,8 +2565,19 @@ async function handleImagePrompt(
     state.lastPrompt = truncate(`[Image] ${prompt}`, 40);
 
     if (state.ttsEnabled) {
-      if (state.ttsEngine === 'kokoro') speakWithKokoro(userId, clean).catch(() => {});
-      else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) speakWithElevenLabs(session, clean, userId, state.genParams.elevenLabsVoiceId).catch(() => {});
+      if (state.ttsEngine === 'kokoro') speakWithKokoro(userId, clean, state.genParams.kokoroVoice || undefined).catch(() => {});
+      else if (state.ttsEngine === 'elevenlabs' && ELEVENLABS_API_KEY) {
+        speakWithElevenLabs(session, clean, userId, state.genParams.elevenLabsVoiceId).catch(() => {});
+        // Estimate audio duration from character count.
+        // ElevenLabs at speed 1.1 ≈ 13 chars/sec. Add 2.5s buffer for
+        // BLE transmission and speaker hardware drain.
+        const elevenEstMs = Math.round((clean.length / 13) * 1000) + 2500;
+        // Delay tts_start so the reloaded page has time to re-establish
+        // its SSE connection before the avatar trigger arrives.
+        setTimeout(() => {
+          broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
+        }, 1200);
+      }
     }
 
     const displayText = truncateForDisplay(clean);
@@ -2364,10 +2926,14 @@ async function webSearch(query: string): Promise<string> {
   }
 }
 
-async function speakWithElevenLabs(session: AppSession, text: string, userId: string, voiceId?: string): Promise<void> {
+async function speakWithElevenLabs(session: AppSession | undefined, text: string, userId: string, voiceId?: string): Promise<void> {
   if (!ELEVENLABS_API_KEY) return;
   try {
     const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
+    if (!session) {
+      console.log(`[TTS] ElevenLabs skipped — no glasses session for ${userId}`);
+      return;
+    }
     const result = await (session.audio as any).speak(safeText, {
       voice_id: (voiceId || ELEVENLABS_VOICE_ID) || undefined,
       voice_settings: {
@@ -2377,7 +2943,8 @@ async function speakWithElevenLabs(session: AppSession, text: string, userId: st
       },
     });
     if (result?.success) {
-      console.log(`[TTS] ElevenLabs spoke ${safeText.length} chars (${result.duration ?? '?'}s) for ${userId}`);
+      const durSec = typeof result.duration === 'number' ? result.duration : null;
+      console.log(`[TTS] ElevenLabs spoke ${safeText.length} chars (${durSec ?? '?'}s) for ${userId}`);
     } else {
       console.log(`[TTS] ElevenLabs failed: ${result?.error ?? 'unknown error'}`);
     }
@@ -2386,7 +2953,7 @@ async function speakWithElevenLabs(session: AppSession, text: string, userId: st
   }
 }
 
-async function speakWithKokoro(userId: string, text: string): Promise<void> {
+async function speakWithKokoro(userId: string, text: string, voiceOverride?: string): Promise<void> {
   try {
     const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
     const r = await fetch(`${KOKORO_HOST}/v1/audio/speech`, {
@@ -2395,7 +2962,7 @@ async function speakWithKokoro(userId: string, text: string): Promise<void> {
       body: JSON.stringify({
         model: 'kokoro',
         input: safeText,
-        voice: KOKORO_VOICE,
+        voice: (voiceOverride || KOKORO_VOICE) || 'af_bella',
         response_format: 'mp3',
         speed: 1.0,
       }),
@@ -2409,7 +2976,7 @@ async function speakWithKokoro(userId: string, text: string): Promise<void> {
     audioCache.set(id, { buf: audioBuffer, expires: Date.now() + 300_000 });
     const audioUrl = `/tts-audio/${id}`;
     broadcastToUser(userId, 'tts_audio', { url: audioUrl });
-    console.log(`[TTS] Kokoro → SSE audio push (${safeText.length} chars, voice: ${KOKORO_VOICE})`);
+    console.log(`[TTS] Kokoro → SSE audio push (${safeText.length} chars, voice: ${voiceOverride || KOKORO_VOICE})`);
     cancelAutoClearTimer(userId);
     const ks = getState(userId);
     ks.autoClearTimer = setTimeout(async () => {
