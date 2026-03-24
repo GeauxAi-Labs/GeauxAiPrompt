@@ -795,7 +795,7 @@ kbd{
   <div id="tlog-list" style="flex:1;overflow-y:auto;padding:12px 16px;">
     <div id="tlog-empty" style="text-align:center;color:var(--tx3);font-size:10px;padding:40px 0;letter-spacing:.06em;">No transcriptions yet this session</div>
   </div>
-  <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
+  <div style="display:flex;gap:8px;padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom,16px));border-top:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
     <button onclick="clearTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--r);">\uD83D\uDDD1 CLEAR</button>
     <button onclick="saveTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--g2);">\uD83D\uDCBE SAVE .TXT</button>
   </div>
@@ -808,7 +808,7 @@ kbd{
   var tok=sp.get('token')||sp.get('t')||'';
   var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
   var pOpen=false;
-  var transcriptLog=[];
+  var transcriptLog=(function(){try{var s=localStorage.getItem('geaux_tlog');return s?JSON.parse(s):[];}catch(e){return [];}})();
   var overlayOpen=false;
 
   window.toggleP=function(){
@@ -1011,6 +1011,10 @@ kbd{
   };
 
   // ── Transcript Log ────────────────────────────────────────────────────
+  function tlogSave(){
+    try{localStorage.setItem('geaux_tlog',JSON.stringify(transcriptLog));}catch(e){}
+  }
+
   function tlogUpdateCount(){
     var n=transcriptLog.length;
     var c=document.getElementById('tlog-count');
@@ -1055,7 +1059,7 @@ kbd{
   };
 
   window.clearTranscriptLog=function(){
-    transcriptLog=[];tlogUpdateCount();tlogRender();
+    transcriptLog=[];tlogSave();tlogUpdateCount();tlogRender();
   };
 
   window.saveTranscriptLog=function(){
@@ -1074,6 +1078,7 @@ kbd{
 
   window.addEventListener('geaux:transcript',function(e){
     transcriptLog.unshift({ts:e.detail.ts,text:e.detail.text});
+    tlogSave();
     tlogUpdateCount();
     if(overlayOpen) tlogRender();
   });
