@@ -252,7 +252,6 @@ function buildPage(
 <title>GeauxAI · G1</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -510,8 +509,9 @@ kbd{
 /* ── TTS Avatar ─────────────────────────────────────────────────────────── */
 #tts-avatar{
   width:100%;height:100%;
-  filter:drop-shadow(0 0 28px #00ffff55);
+  filter:drop-shadow(0 0 24px #7c3aedbb);
 }
+#tts-avatar.visible{display:block}
 #av-close{
   position:absolute;top:-8px;right:-8px;
   width:22px;height:22px;border-radius:50%;
@@ -755,8 +755,37 @@ kbd{
   <button class="ft-prev-rm" id="ft-prev-rm" title="Remove file">✕</button>
 </div>
 <!-- TTS avatar -->
-<div id="av-wrap" style="position:fixed;bottom:90px;left:50%;transform:translateX(-50%);z-index:100;width:230px;height:230px;display:none;pointer-events:all;">
-  <div id="tts-avatar"></div>
+<div id="av-wrap" style="position:fixed;bottom:90px;right:14px;z-index:100;width:306px;height:306px;display:none;pointer-events:all;">
+  <svg id="tts-avatar" viewBox="0 0 72 72" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:100%">
+  <defs>
+    <radialGradient id="faceGrad" cx="50%" cy="45%" r="50%">
+      <stop offset="0%" stop-color="#2d1a4a"/>
+      <stop offset="100%" stop-color="#110e24"/>
+    </radialGradient>
+  </defs>
+  <circle cx="36" cy="36" r="34" fill="url(#faceGrad)"
+    stroke="#7c3aed" stroke-width="1.5" stroke-opacity=".6"/>
+  <ellipse cx="25" cy="29" rx="4" ry="4.5" fill="#1a0e38"/>
+  <ellipse id="av-pupil-l" cx="25" cy="29" rx="2.5" ry="3" fill="#a855f7" opacity=".9"/>
+  <ellipse cx="47" cy="29" rx="4" ry="4.5" fill="#1a0e38"/>
+  <ellipse id="av-pupil-r" cx="47" cy="29" rx="2.5" ry="3" fill="#a855f7" opacity=".9"/>
+  <circle cx="26.5" cy="27.5" r="1" fill="#c4b5fd" opacity=".8"/>
+  <circle cx="48.5" cy="27.5" r="1" fill="#c4b5fd" opacity=".8"/>
+  <!-- Eyelids — ry animated to 4.5 (closed) or 0 (open) via JS -->
+  <ellipse id="av-lid-l" cx="25" cy="29" rx="4.2" ry="0"
+    fill="#110e24"/>
+  <ellipse id="av-lid-r" cx="47" cy="29" rx="4.2" ry="0"
+    fill="#110e24"/>
+  <circle cx="36" cy="37" r="1.2" fill="#7c3aed" opacity=".35"/>
+  <ellipse id="av-mouth" cx="36" cy="47" rx="7" ry="1.2"
+    fill="#0d0920" stroke="#a855f7" stroke-width="1.3"/>
+  <circle cx="36" cy="36" r="34" fill="none"
+    stroke="#7c3aed" stroke-width=".8" stroke-opacity=".25"
+    stroke-dasharray="4 7">
+    <animateTransform attributeName="transform" type="rotate"
+      from="0 36 36" to="360 36 36" dur="14s" repeatCount="indefinite"/>
+  </circle>
+</svg>
   <div id="av-close" onclick="window._avClose && window._avClose()">✕</div>
 </div>
 <footer class="ft">
@@ -1080,185 +1109,418 @@ kbd{
 })();
 </script>
 <script>
-/* ── TTS Avatar — Lottie waveform ────────────────────────────────── */
-(function(){
-  var wrap      = document.getElementById('av-wrap');
-  var container = document.getElementById('tts-avatar');
-  var closeBtn  = document.getElementById('av-close');
-  if (!wrap || !container) return;
-
-  // ── Lottie setup ──────────────────────────────────────────────────
-  var anim      = null;
-  var animReady = false;
-  var wantPlay  = false; // play requested before anim loaded
-
-  function initLottie() {
-    if (anim) return;
-    anim = lottie.loadAnimation({
-      container: container,
-      renderer:  'svg',
-      loop:      true,
-      autoplay:  false,
-      path:      '/lottie-avatar.json',
-    });
-    anim.addEventListener('DOMLoaded', function() {
-      animReady = true;
-      if (wantPlay) { anim.play(); wantPlay = false; }
-    });
-  }
-
-  function startAnim() {
-    if (!animReady) { wantPlay = true; initLottie(); return; }
-    anim.play();
-  }
-
-  function stopAnim() {
-    wantPlay = false;
-    if (!animReady || !anim) return;
-    anim.stop(); // goes back to frame 0 — bars flat
-  }
-
-  // ── Show / Hide ───────────────────────────────────────────────────
-  function showAvatar() {
-    var _avPref = document.getElementById('p-avatar');
-    if (_avPref && !_avPref.checked) return;
-    initLottie();
-    wrap.style.display = 'block';
-    if (closeBtn) closeBtn.style.display = 'block';
-    startAnim();
-  }
-
-  function hideAvatar() {
-    stopAnim();
-    wrap.style.display = 'none';
-    if (closeBtn) closeBtn.style.display = 'none';
-  }
-
-  window._avClose = hideAvatar;
-
-  // ── Drag to move (no float) ───────────────────────────────────────
-  var dragging     = false;
-  var dragOffX     = 0;
-  var dragOffY     = 0;
-  var dragAnchored = true;
-
-  function toAbsolute() {
-    if (!dragAnchored) return;
-    var rect = wrap.getBoundingClientRect();
-    wrap.style.transform = 'none';
-    wrap.style.top    = rect.top  + 'px';
-    wrap.style.left   = rect.left + 'px';
-    wrap.style.bottom = 'auto';
-    dragAnchored = false;
-  }
-
-  function onDragStart(clientX, clientY) {
-    if (closeBtn && closeBtn.contains(document.elementFromPoint(clientX, clientY))) return;
-    toAbsolute();
-    dragging = true;
-    var rect = wrap.getBoundingClientRect();
-    dragOffX = clientX - rect.left;
-    dragOffY = clientY - rect.top;
-    wrap.classList.add('dragging');
-    wrap.classList.remove('draggable');
-  }
-
-  function onDragMove(clientX, clientY) {
-    if (!dragging) return;
-    var newLeft = clientX - dragOffX;
-    var newTop  = clientY - dragOffY;
-    var maxLeft = window.innerWidth  - wrap.offsetWidth  - 10;
-    var maxTop  = window.innerHeight - wrap.offsetHeight - 10;
-    newLeft = Math.max(10, Math.min(newLeft, maxLeft));
-    newTop  = Math.max(10, Math.min(newTop,  maxTop));
-    wrap.style.left = newLeft + 'px';
-    wrap.style.top  = newTop  + 'px';
-  }
-
-  function onDragEnd() {
-    if (!dragging) return;
-    dragging = false;
-    wrap.classList.remove('dragging');
-    wrap.classList.add('draggable');
-  }
-
-  wrap.addEventListener('mousedown', function(e) { onDragStart(e.clientX, e.clientY); e.preventDefault(); });
-  document.addEventListener('mousemove', function(e) { onDragMove(e.clientX, e.clientY); });
-  document.addEventListener('mouseup', function() { onDragEnd(); });
-  wrap.addEventListener('touchstart', function(e) { var t=e.touches[0]; onDragStart(t.clientX,t.clientY); }, { passive: true });
-  document.addEventListener('touchmove', function(e) { if(!dragging) return; var t=e.touches[0]; onDragMove(t.clientX,t.clientY); e.preventDefault(); }, { passive: false });
-  document.addEventListener('touchend', function() { onDragEnd(); });
-  wrap.classList.add('draggable');
-
-  // ── Kokoro path — hook the audio element ─────────────────────────
-  function hookPlayer(el) {
-    if (el._avHooked) return;
-    el._avHooked = true;
-    el.addEventListener('play',  function(){ showAvatar(); });
-    el.addEventListener('pause', function(){ hideAvatar(); });
-    el.addEventListener('ended', function(){ hideAvatar(); });
-  }
-
-  var existing = document.getElementById('_kplayer');
-  if (existing) hookPlayer(existing);
-
-  new MutationObserver(function(muts) {
-    for (var i = 0; i < muts.length; i++) {
-      var nodes = muts[i].addedNodes;
-      for (var j = 0; j < nodes.length; j++) {
-        if (nodes[j].id === '_kplayer') hookPlayer(nodes[j]);
-      }
-    }
-  }).observe(document.body, { childList: true });
-
-  // ── ElevenLabs path — SSE tts_start / tts_end events ─────────────
+  /* ── TTS Avatar ─────────────────────────────────────────────────────── */
   (function(){
-    var sp2   = new URLSearchParams(window.location.search);
-    var tok2  = sp2.get('token') || sp2.get('t') || '';
-    var authQ2 = tok2 ? ('?' + (sp2.get('token') ? 'token' : 't') + '=' + encodeURIComponent(tok2)) : '';
-    var elTimer = null;
-    try {
-      var es2 = new EventSource('/api/stream' + authQ2);
+    var wrap   = document.getElementById('av-wrap');
+    var avatar = document.getElementById('tts-avatar');
+    var mouth  = document.getElementById('av-mouth');
+    var closeBtn = document.getElementById('av-close');
+    if (!wrap || !avatar || !mouth) return;
 
-      es2.addEventListener('tts_start', function(e) {
-        try {
-          var d = JSON.parse(e.data);
-          if (d.engine === 'elevenlabs') {
-            clearTimeout(elTimer);
-            showAvatar();
-            // Fallback stop: use estimatedMs if provided, else 30s safety cap
-            var ms = (d.estimatedMs && d.estimatedMs > 0) ? d.estimatedMs : 30000;
-            elTimer = setTimeout(hideAvatar, ms);
-          }
-        } catch(ex) {}
-      });
+    var audioCtx  = null;
+    var analyser  = null;
+    var dataArr   = null;
+    var rafId     = null;
+    var simAnim   = null;
 
-      // tts_end fired by server when ElevenLabs speak() resolves
-      es2.addEventListener('tts_end', function(e) {
-        try {
-          var d = JSON.parse(e.data);
-          if (d.engine === 'elevenlabs') {
-            clearTimeout(elTimer);
-            hideAvatar();
-          }
-        } catch(ex) {}
-      });
+    // Eye animation state
+    var lidL = null;
+    var lidR = null;
+    var pupL = null;
+    var pupR = null;
+    var eyeAnimId = null;   // RAF for pupil drift during speaking
+    var blinkTimer = null;  // setTimeout chain for random blinks
+    var isSpeaking = false; // true while avatar is showing + animating
 
-      // Hide if a new AI processing cycle starts (user sent another prompt)
-      es2.addEventListener('state', function(e) {
-        try {
-          var d = JSON.parse(e.data);
-          if (d.processing === true && wrap.style.display === 'block') {
-            clearTimeout(elTimer);
-            hideAvatar();
+    initEyes();
+
+    // ── Drag to move ───────────────────────────────────────────────
+    // On first drag we switch from bottom/right to top/left coords
+    // so JS can freely reposition the wrapper.
+    var dragging    = false;
+    var dragOffX    = 0;
+    var dragOffY    = 0;
+    var dragAnchored = true; // true = still using bottom/right CSS
+
+    // ── Float state ───────────────────────────────────────────────────────────
+    var floatRafId  = null;   // requestAnimationFrame id for float loop
+    var floatT      = 0;      // time counter driving the sine paths
+    var floatBaseX  = 0;      // current base left position (px)
+    var floatBaseY  = 0;      // current base top position (px)
+    var floatVX     = 0;      // slow drift velocity X (px/frame)
+    var floatVY     = 0;      // slow drift velocity Y (px/frame)
+    var floatDirTimer = null; // timer to pick new drift direction
+
+    function toTopLeft() {
+      if (!dragAnchored) return;
+      // Convert current bottom/right position to top/left
+      var rect = wrap.getBoundingClientRect();
+      wrap.style.top    = rect.top  + 'px';
+      wrap.style.left   = rect.left + 'px';
+      wrap.style.bottom = 'auto';
+      wrap.style.right  = 'auto';
+      dragAnchored = false;
+    }
+
+    function onDragStart(clientX, clientY) {
+      // Don't start drag if clicking the close button
+      if (closeBtn && closeBtn.contains(document.elementFromPoint(clientX, clientY))) return;
+      toTopLeft();
+      dragging = true;
+      var rect = wrap.getBoundingClientRect();
+      dragOffX = clientX - rect.left;
+      dragOffY = clientY - rect.top;
+      wrap.classList.add('dragging');
+      wrap.classList.remove('draggable');
+    }
+
+    function onDragMove(clientX, clientY) {
+      if (!dragging) return;
+      var newLeft = clientX - dragOffX;
+      var newTop  = clientY - dragOffY;
+      // Clamp within viewport with 10px margin
+      var maxLeft = window.innerWidth  - wrap.offsetWidth  - 10;
+      var maxTop  = window.innerHeight - wrap.offsetHeight - 10;
+      newLeft = Math.max(10, Math.min(newLeft, maxLeft));
+      newTop  = Math.max(10, Math.min(newTop,  maxTop));
+      wrap.style.left = newLeft + 'px';
+      wrap.style.top  = newTop  + 'px';
+    }
+
+    function onDragEnd() {
+      if (!dragging) return;
+      dragging = false;
+      wrap.classList.remove('dragging');
+      wrap.classList.add('draggable');
+      // Re-seed float base position from drop location
+      // so float resumes from where the user left it
+      var rect   = wrap.getBoundingClientRect();
+      floatBaseX = rect.left;
+      floatBaseY = rect.top;
+    }
+
+    // Mouse events
+    wrap.addEventListener('mousedown', function(e) {
+      onDragStart(e.clientX, e.clientY);
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e) {
+      onDragMove(e.clientX, e.clientY);
+    });
+    document.addEventListener('mouseup', function() {
+      onDragEnd();
+    });
+
+    // Touch events (mobile webview)
+    wrap.addEventListener('touchstart', function(e) {
+      var t = e.touches[0];
+      onDragStart(t.clientX, t.clientY);
+    }, { passive: true });
+    document.addEventListener('touchmove', function(e) {
+      if (!dragging) return;
+      var t = e.touches[0];
+      onDragMove(t.clientX, t.clientY);
+      e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchend', function() {
+      onDragEnd();
+    });
+
+    // Add initial draggable class so cursor shows on hover
+    wrap.classList.add('draggable');
+    // ── End drag ─────────────────────────────────────────────────────
+
+    // ── Float ─────────────────────────────────────────────────────
+    function pickNewFloatDir() {
+      // Pick a new slow drift direction every 3-6 seconds
+      var angle = Math.random() * Math.PI * 2;
+      var speed = 0.18 + Math.random() * 0.14; // 0.18-0.32 px/frame
+      floatVX = Math.cos(angle) * speed;
+      floatVY = Math.sin(angle) * speed;
+      floatDirTimer = setTimeout(pickNewFloatDir, 3000 + Math.random() * 3000);
+    }
+
+    function floatTick() {
+      if (!dragging) {
+        var w = wrap.offsetWidth  || 306;
+        var h = wrap.offsetHeight || 306;
+        var maxX = window.innerWidth  - w - 10;
+        var maxY = window.innerHeight - h - 10;
+
+        // Advance base position by velocity
+        floatBaseX += floatVX;
+        floatBaseY += floatVY;
+
+        // Add a gentle sine wobble on top of the drift
+        floatT += 0.012;
+        var wobbleX = Math.sin(floatT * 1.3) * 1.8;
+        var wobbleY = Math.cos(floatT)        * 1.4;
+
+        var newLeft = floatBaseX + wobbleX;
+        var newTop  = floatBaseY + wobbleY;
+
+        // Bounce off edges — reverse velocity component on hit
+        if (newLeft < 10)     { newLeft = 10;   floatVX =  Math.abs(floatVX); floatBaseX = 10; }
+        if (newLeft > maxX)   { newLeft = maxX; floatVX = -Math.abs(floatVX); floatBaseX = maxX; }
+        if (newTop  < 10)     { newTop  = 10;   floatVY =  Math.abs(floatVY); floatBaseY = 10; }
+        if (newTop  > maxY)   { newTop  = maxY; floatVY = -Math.abs(floatVY); floatBaseY = maxY; }
+
+        wrap.style.left = newLeft.toFixed(1) + 'px';
+        wrap.style.top  = newTop.toFixed(1)  + 'px';
+      }
+      floatRafId = requestAnimationFrame(floatTick);
+    }
+
+    function startFloat() {
+      // Convert to top/left coords if still using bottom/right
+      toTopLeft();
+      // Seed base position from current rendered position
+      var rect   = wrap.getBoundingClientRect();
+      floatBaseX = rect.left;
+      floatBaseY = rect.top;
+      // Start with a gentle random direction
+      pickNewFloatDir();
+      if (!floatRafId) floatRafId = requestAnimationFrame(floatTick);
+    }
+
+    function stopFloat() {
+      if (floatRafId) { cancelAnimationFrame(floatRafId); floatRafId = null; }
+      if (floatDirTimer) { clearTimeout(floatDirTimer); floatDirTimer = null; }
+    }
+    // ── End float ─────────────────────────────────────────────────
+
+    // ── Eye helpers ───────────────────────────────────────────────
+    function initEyes() {
+      lidL = document.getElementById('av-lid-l');
+      lidR = document.getElementById('av-lid-r');
+      pupL = document.getElementById('av-pupil-l');
+      pupR = document.getElementById('av-pupil-r');
+    }
+
+    function blink() {
+      if (!lidL || !lidR) return;
+      // Close lids over 60ms, hold 40ms, open over 60ms
+      lidL.setAttribute('ry', '4.5');
+      lidR.setAttribute('ry', '4.5');
+      setTimeout(function() {
+        lidL.setAttribute('ry', '0');
+        lidR.setAttribute('ry', '0');
+      }, 100);
+      // Schedule next blink randomly 2-5 seconds away
+      blinkTimer = setTimeout(blink, 2000 + Math.random() * 3000);
+    }
+
+    function startBlink() {
+      if (blinkTimer) return;
+      // Small initial delay so first blink feels natural
+      blinkTimer = setTimeout(blink, 800 + Math.random() * 1500);
+    }
+
+    function stopBlink() {
+      if (blinkTimer) { clearTimeout(blinkTimer); blinkTimer = null; }
+      if (lidL) lidL.setAttribute('ry', '0');
+      if (lidR) lidR.setAttribute('ry', '0');
+    }
+
+    // Pupil drift — slow random movement while speaking
+    // Pupils wander within a 2px radius of center then drift back
+    var pupilTargetX = 0;
+    var pupilTargetY = 0;
+    var pupilCurX = 0;
+    var pupilCurY = 0;
+    var pupilDriftFrames = 0;
+    var pupilDriftTarget = 30;
+
+    function tickPupils() {
+      if (!pupL || !pupR || !isSpeaking) return;
+      pupilDriftFrames++;
+      if (pupilDriftFrames >= pupilDriftTarget) {
+        // Pick a new wander target within ±2 units of eye center
+        pupilTargetX = (Math.random() - 0.5) * 3.5;
+        pupilTargetY = (Math.random() - 0.5) * 2;
+        pupilDriftTarget = 20 + Math.floor(Math.random() * 40);
+        pupilDriftFrames = 0;
+      }
+      // Ease toward target (lerp factor 0.06 = slow drift)
+      pupilCurX += (pupilTargetX - pupilCurX) * 0.06;
+      pupilCurY += (pupilTargetY - pupilCurY) * 0.06;
+      pupL.setAttribute('cx', (25 + pupilCurX).toFixed(2));
+      pupL.setAttribute('cy', (29 + pupilCurY).toFixed(2));
+      pupR.setAttribute('cx', (47 + pupilCurX).toFixed(2));
+      pupR.setAttribute('cy', (29 + pupilCurY).toFixed(2));
+      eyeAnimId = requestAnimationFrame(tickPupils);
+    }
+
+    function startEyeAnim() {
+      isSpeaking = true;
+      startBlink();
+      if (!eyeAnimId) eyeAnimId = requestAnimationFrame(tickPupils);
+    }
+
+    function stopEyeAnim() {
+      isSpeaking = false;
+      stopBlink();
+      if (eyeAnimId) { cancelAnimationFrame(eyeAnimId); eyeAnimId = null; }
+      // Return pupils to center
+      if (pupL) { pupL.setAttribute('cx', '25'); pupL.setAttribute('cy', '29'); }
+      if (pupR) { pupR.setAttribute('cx', '47'); pupR.setAttribute('cy', '29'); }
+      pupilCurX = 0; pupilCurY = 0;
+      pupilTargetX = 0; pupilTargetY = 0;
+    }
+    // ── End eye helpers ───────────────────────────────────────────
+
+    function initCtx(audioEl) {
+      if (audioCtx) return;
+      try {
+        audioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+        analyser  = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        dataArr   = new Uint8Array(analyser.frequencyBinCount);
+        var src   = audioCtx.createMediaElementSource(audioEl);
+        src.connect(analyser);
+        analyser.connect(audioCtx.destination);
+      } catch(e) { audioCtx = null; }
+    }
+
+    function getRMS() {
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(dataArr);
+      var sum = 0;
+      for (var i = 0; i < dataArr.length; i++) {
+        var v = (dataArr[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / dataArr.length);
+    }
+
+    function tick() {
+      var ry = Math.min(6, Math.max(1.2, getRMS() * 22));
+      mouth.setAttribute('ry', ry.toFixed(1));
+      rafId = requestAnimationFrame(tick);
+    }
+
+    function stopSimAnim() {
+      if (simAnim) { clearInterval(simAnim); simAnim = null; }
+    }
+
+    function showAvatar(audioEl) {
+      var _avPref = document.getElementById('p-avatar');
+      if (_avPref && !_avPref.checked) return;
+      if (audioEl) {
+        stopSimAnim();
+        initCtx(audioEl);
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        if (!rafId) rafId = requestAnimationFrame(tick);
+      } else {
+        if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+        stopSimAnim();
+        var speechState = 0;
+        var stateFrames = 0;
+        var stateTarget = 3;
+        simAnim = setInterval(function() {
+          stateFrames++;
+          if (stateFrames >= stateTarget) {
+            var r = Math.random();
+            if (r < 0.12)      { speechState = 0; stateTarget = 2 + Math.floor(Math.random() * 4); }
+            else if (r < 0.35) { speechState = 3; stateTarget = 1 + Math.floor(Math.random() * 3); }
+            else if (r < 0.65) { speechState = 1; stateTarget = 2 + Math.floor(Math.random() * 4); }
+            else               { speechState = 2; stateTarget = 2 + Math.floor(Math.random() * 5); }
+            stateFrames = 0;
           }
-        } catch(ex) {}
-      });
-    } catch(ex) {}
+          var baseRy;
+          if      (speechState === 0) baseRy = 1.2;
+          else if (speechState === 1) baseRy = 3.0;
+          else if (speechState === 2) baseRy = 5.2;
+          else                        baseRy = 1.8;
+          var jitter = (Math.random() - 0.5) * 0.6;
+          var ry = Math.min(6, Math.max(1.2, baseRy + jitter));
+          mouth.setAttribute('ry', ry.toFixed(1));
+        }, 65);
+      }
+      wrap.style.display = 'block';
+      if (closeBtn) closeBtn.style.display = 'block';
+      startEyeAnim();
+      startFloat();
+    }
+
+    function hideAvatar() {
+      stopSimAnim();
+      wrap.style.display = 'none';
+      if (closeBtn) closeBtn.style.display = 'none';
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      mouth.setAttribute('ry', '1.2');
+      stopEyeAnim();
+      stopFloat();
+    }
+
+    function restMouth() {
+      stopSimAnim();
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      mouth.setAttribute('ry', '1.2');
+      stopEyeAnim();
+      // Restart idle blink while avatar stays visible after speaking
+      startBlink();
+    }
+
+    // Close button handler
+    window._avClose = hideAvatar;
+
+    // ── Kokoro path ───────────────────────────────────────────────────
+    function hookPlayer(el) {
+      if (el._avHooked) return;
+      el._avHooked = true;
+      el.addEventListener('play',  function(){ showAvatar(el); });
+      el.addEventListener('pause', function(){ hideAvatar(); });
+      el.addEventListener('ended', function(){ hideAvatar(); });
+    }
+
+    var existing = document.getElementById('_kplayer');
+    if (existing) hookPlayer(existing);
+
+    new MutationObserver(function(muts) {
+      for (var i = 0; i < muts.length; i++) {
+        var nodes = muts[i].addedNodes;
+        for (var j = 0; j < nodes.length; j++) {
+          if (nodes[j].id === '_kplayer') hookPlayer(nodes[j]);
+        }
+      }
+    }).observe(document.body, { childList: true });
+
+    // ── ElevenLabs path ───────────────────────────────────────────────
+    (function(){
+      var sp2 = new URLSearchParams(window.location.search);
+      var tok2 = sp2.get('token') || sp2.get('t') || '';
+      var authQ2 = tok2 ? ('?' + (sp2.get('token') ? 'token' : 't') + '=' + encodeURIComponent(tok2)) : '';
+      var restTimer = null;
+      try {
+        var es2 = new EventSource('/api/stream' + authQ2);
+        es2.addEventListener('tts_start', function(e) {
+          try {
+            var d = JSON.parse(e.data);
+            if (d.engine === 'elevenlabs') {
+              clearTimeout(restTimer);
+              showAvatar(null);
+              // Use server-estimated duration to stop mouth animation.
+              // estimatedMs already includes BLE + hardware drain buffer.
+              var ms = (d.estimatedMs && d.estimatedMs > 0) ? d.estimatedMs : 12000;
+              restTimer = setTimeout(restMouth, ms);
+            }
+          } catch(ex) {}
+        });
+        // Auto-hide avatar when next prompt starts processing
+        es2.addEventListener('state', function(e) {
+          try {
+            var d = JSON.parse(e.data);
+            if (d.processing === true && wrap.style.display === 'block') {
+              clearTimeout(restTimer);
+              hideAvatar();
+            }
+          } catch(ex) {}
+        });
+      } catch(ex) {}
+    })();
   })();
-
-})();
-</script>
+  </script>
 </body>
 </html>`;
 }
@@ -1547,10 +1809,6 @@ class GeauxAIApp extends AppServer {
     // The MentraOS SDK sets up JSON body parsing but NOT urlencoded — we add both here.
     app.use(require('express').urlencoded({ extended: false, limit: '1mb' }));
     app.use(require('express').json({ limit: '25mb' }));
-
-    app.use('/lottie-avatar.json', (_req: any, res: any) => {
-      res.sendFile(require('path').join(__dirname, 'voice.json'));
-    });
 
     // ── Per-request user resolver ─────────────────────────────────────────────
     // The SDK auth middleware sets req.authUserId from the signed token on every
@@ -2690,11 +2948,8 @@ async function speakWithElevenLabs(session: AppSession | undefined, text: string
     } else {
       console.log(`[TTS] ElevenLabs failed: ${result?.error ?? 'unknown error'}`);
     }
-    // Broadcast tts_end so the webview avatar stops animating
-    broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs' });
   } catch (err: any) {
     console.log(`[TTS] ElevenLabs error: ${err.message}`);
-    broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs' });
   }
 }
 

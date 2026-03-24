@@ -534,6 +534,7 @@ kbd{
   var tok=sp.get('token')||sp.get('t')||'';
   var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
   var sseTimer=null;
+  var lastPartial = '';
 
   function applyState(d){
     var dot=document.querySelector('.sdot');
@@ -561,8 +562,9 @@ kbd{
     }
     if(d.reload){
       var inp=document.getElementById('ft-inp');
-      if(inp && inp.value.trim().length>0){
-        // User is typing — reload after they clear/submit instead of wiping their text
+      if(window._transcriptOverlayOpen){
+        window._pendingReloadWhileOverlay=true;
+      } else if(inp && inp.value.trim().length>0){
         inp.dataset.pendingReload='1';
       } else {
         window.location.reload();
@@ -608,7 +610,23 @@ kbd{
       clearTimeout(sseTimer);
       sseTimer=setTimeout(safeReload,120000);
     });
-    es.addEventListener('listening',function(e){try{applyListening(JSON.parse(e.data));}catch(ex){}});
+    es.addEventListener('listening', function(e) {
+      try {
+        var d = JSON.parse(e.data);
+        applyListening(d);
+        if (d.active && d.partial && d.partial.trim().length > 0) {
+          lastPartial = d.partial.trim();
+        }
+        if (!d.active && lastPartial.length > 0) {
+          var now2 = new Date();
+          var ts2 = now2.toTimeString().slice(0, 8);
+          window.dispatchEvent(new CustomEvent('geaux:transcript', {
+            detail: { ts: ts2, text: lastPartial }
+          }));
+          lastPartial = '';
+        }
+      } catch(ex) {}
+    });
     es.addEventListener('tts_audio', function(e) {
       try {
         var d = JSON.parse(e.data);
@@ -680,6 +698,7 @@ kbd{
   <div class="sdot ${dotClass}"></div>
   <div class="stxt" id="stxt">${statusText}</div>
   ${promptCount > 0 ? `<span class="scount">${promptCount} prompt${promptCount !== 1 ? 's' : ''}</span>` : ''}
+  <button id="sbar-log-btn" onclick="openTranscriptLog()" title="View transcription log" style="background:transparent;border:none;cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--tx3);padding:1px 4px;flex-shrink:0;opacity:0.55;">📋</button>
 </div>
 
 <div id="lbar" class="lbar">
@@ -744,6 +763,9 @@ kbd{
       <span class="p-lbl">MAX TOKENS <span class="p-hint">— max length of AI response (256–32000)</span></span>
       <input type="number" class="p-num" id="p-maxtok" min="256" max="32000" value="4096">
     </div>
+    <div class="p-row">
+      <button id="p-transcript-btn" onclick="openTranscriptLog()" style="width:100%;padding:8px 12px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.10em;text-transform:uppercase;color:var(--v3);text-align:left;">📋 TRANSCRIPTION LOG &nbsp;<span data-tc>(0 entries)</span></button>
+    </div>
   </div>
 </div>
 
@@ -765,6 +787,19 @@ kbd{
   <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="10000" rows="1"></textarea>
   <button class="ft-go" id="ft-go" title="Send">↑</button>
 </footer>
+<div id="transcript-overlay" style="position:fixed;inset:0;z-index:500;background:var(--bg);display:flex;flex-direction:column;transform:translateY(100%);transition:transform 250ms ease;font-family:var(--mono);pointer-events:none;">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
+    <span style="font-size:11px;font-weight:700;letter-spacing:.12em;color:var(--v3);">\uD83D\uDCCB TRANSCRIPTION LOG <span id="tlog-count" style="opacity:.6;font-weight:400;">(0)</span></span>
+    <button onclick="closeTranscriptLog()" style="background:transparent;border:1px solid var(--edge);border-radius:6px;color:var(--tx2);font-size:13px;width:28px;height:28px;cursor:pointer;">✕</button>
+  </div>
+  <div id="tlog-list" style="flex:1;overflow-y:auto;padding:12px 16px;">
+    <div id="tlog-empty" style="text-align:center;color:var(--tx3);font-size:10px;padding:40px 0;letter-spacing:.06em;">No transcriptions yet this session</div>
+  </div>
+  <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
+    <button onclick="clearTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--r);">\uD83D\uDDD1 CLEAR</button>
+    <button onclick="saveTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--g2);">\uD83D\uDCBE SAVE .TXT</button>
+  </div>
+</div>
 </div>
 
 <script>
@@ -773,6 +808,8 @@ kbd{
   var tok=sp.get('token')||sp.get('t')||'';
   var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
   var pOpen=false;
+  var transcriptLog=[];
+  var overlayOpen=false;
 
   window.toggleP=function(){
     pOpen=!pOpen;
@@ -972,6 +1009,74 @@ kbd{
           if(d.ttsEnabled){chip.classList.remove('off');}else{chip.classList.add('off');}}
       }).catch(function(){});
   };
+
+  // ── Transcript Log ────────────────────────────────────────────────────
+  function tlogUpdateCount(){
+    var n=transcriptLog.length;
+    var c=document.getElementById('tlog-count');
+    if(c) c.textContent='('+n+')';
+    var b=document.getElementById('p-transcript-btn');
+    if(b){var s=b.querySelector('span[data-tc]');if(s) s.textContent='('+n+(n===1?' entry':' entries')+')';}  }
+
+  function tlogRender(){
+    var list=document.getElementById('tlog-list');
+    var empty=document.getElementById('tlog-empty');
+    if(!list) return;
+    list.querySelectorAll('.tlog-row').forEach(function(r){r.remove();});
+    if(transcriptLog.length===0){if(empty) empty.style.display='block';return;}
+    if(empty) empty.style.display='none';
+    transcriptLog.forEach(function(entry){
+      var row=document.createElement('div');
+      row.className='tlog-row';
+      row.style.cssText='padding:7px 0;border-bottom:1px solid var(--edge);font-size:10px;line-height:1.5;color:var(--tx);display:flex;gap:10px;align-items:flex-start;';
+      var ts=document.createElement('span');
+      ts.style.cssText='color:var(--v3);flex-shrink:0;font-size:9px;padding-top:1px;';
+      ts.textContent='['+entry.ts+']';
+      var txt=document.createElement('span');
+      txt.style.cssText='flex:1;word-break:break-word;';
+      txt.textContent=entry.text;
+      row.appendChild(ts);row.appendChild(txt);
+      list.appendChild(row);
+    });
+  }
+
+  window.openTranscriptLog=function(){
+    overlayOpen=true;window._transcriptOverlayOpen=true;
+    var ov=document.getElementById('transcript-overlay');
+    if(ov){ov.style.transform='translateY(0)';ov.style.pointerEvents='auto';}
+    tlogRender();
+  };
+
+  window.closeTranscriptLog=function(){
+    overlayOpen=false;window._transcriptOverlayOpen=false;
+    var ov=document.getElementById('transcript-overlay');
+    if(ov){ov.style.transform='translateY(100%)';ov.style.pointerEvents='none';}
+    if(window._pendingReloadWhileOverlay){window._pendingReloadWhileOverlay=false;window.location.reload();}
+  };
+
+  window.clearTranscriptLog=function(){
+    transcriptLog=[];tlogUpdateCount();tlogRender();
+  };
+
+  window.saveTranscriptLog=function(){
+    if(transcriptLog.length===0) return;
+    var now=new Date();
+    var header='GeauxAI Transcription Log \u2014 '+now.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})+' '+now.toLocaleTimeString('en-US');
+    var lines=[header,'\u2500'.repeat(50),''];
+    transcriptLog.slice().reverse().forEach(function(e){lines.push('['+e.ts+'] '+e.text);});
+    var blob=new Blob([lines.join(String.fromCharCode(10))],{type:'text/plain'});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement('a');
+    var yyyy=now.getFullYear(),mm=String(now.getMonth()+1).padStart(2,'0'),dd=String(now.getDate()).padStart(2,'0');
+    a.download='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
+    a.href=url;a.click();URL.revokeObjectURL(url);
+  };
+
+  window.addEventListener('geaux:transcript',function(e){
+    transcriptLog.unshift({ts:e.detail.ts,text:e.detail.text});
+    tlogUpdateCount();
+    if(overlayOpen) tlogRender();
+  });
 
   // Auto-resize textarea
   var inp=document.getElementById('ft-inp');
