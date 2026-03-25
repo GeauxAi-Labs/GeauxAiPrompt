@@ -1071,22 +1071,36 @@ kbd{
     var content=lines.join(String.fromCharCode(10));
     var yyyy=now.getFullYear(),mm=String(now.getMonth()+1).padStart(2,'0'),dd=String(now.getDate()).padStart(2,'0');
     var filename='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
-    if(typeof window.showSaveFilePicker==='function'){
+    var ua=navigator.userAgent||'';
+    var isAndroid=ua.indexOf('Android')!==-1;
+    if(!isAndroid&&typeof window.showSaveFilePicker==='function'){
       window.showSaveFilePicker({
         suggestedName:filename,
         types:[{description:'Text File',accept:{'text/plain':['.txt']}}]
       }).then(function(fh){return fh.createWritable();})
         .then(function(w){return w.write(content).then(function(){return w.close();});})
-        .catch(function(err){if(err&&err.name!=='AbortError'){console.warn('showSaveFilePicker failed, falling back',err);}});
+        .catch(function(err){if(err&&err.name!=='AbortError'){console.warn('showSaveFilePicker failed',err);}});
     } else {
-      var blob=new Blob([content],{type:'text/plain'});
-      var url=URL.createObjectURL(blob);
-      var a=document.createElement('a');
-      a.href=url;
-      a.download=filename;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},200);
+      var encoded=encodeURIComponent(content);
+      var dataUri='data:text/plain;charset=utf-8,'+encoded;
+      var w=window.open(dataUri,'_blank');
+      if(!w){
+        if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+          navigator.clipboard.writeText(content).then(function(){
+            alert('Transcript copied to clipboard!');
+          }).catch(function(){
+            alert('Could not open or copy transcript. Try a different browser.');
+          });
+        } else {
+          var ta=document.createElement('textarea');
+          ta.value=content;
+          ta.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;opacity:.01;z-index:99999;';
+          document.body.appendChild(ta);
+          ta.focus();ta.select();
+          try{document.execCommand('copy');alert('Transcript copied to clipboard!');}catch(e){alert('Could not copy transcript.');}
+          document.body.removeChild(ta);
+        }
+      }
     }
   };
 
