@@ -1068,12 +1068,26 @@ kbd{
     var header='GeauxAI Transcription Log \u2014 '+now.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})+' '+now.toLocaleTimeString('en-US');
     var lines=[header,'\u2500'.repeat(50),''];
     transcriptLog.slice().reverse().forEach(function(e){lines.push('['+e.ts+'] '+e.text);});
-    var blob=new Blob([lines.join(String.fromCharCode(10))],{type:'text/plain'});
-    var url=URL.createObjectURL(blob);
-    var a=document.createElement('a');
+    var content=lines.join(String.fromCharCode(10));
     var yyyy=now.getFullYear(),mm=String(now.getMonth()+1).padStart(2,'0'),dd=String(now.getDate()).padStart(2,'0');
-    a.download='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
-    a.href=url;a.click();URL.revokeObjectURL(url);
+    var filename='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
+    if(typeof window.showSaveFilePicker==='function'){
+      window.showSaveFilePicker({
+        suggestedName:filename,
+        types:[{description:'Text File',accept:{'text/plain':['.txt']}}]
+      }).then(function(fh){return fh.createWritable();})
+        .then(function(w){return w.write(content).then(function(){return w.close();});})
+        .catch(function(err){if(err&&err.name!=='AbortError'){console.warn('showSaveFilePicker failed, falling back',err);}});
+    } else {
+      var blob=new Blob([content],{type:'text/plain'});
+      var url=URL.createObjectURL(blob);
+      var a=document.createElement('a');
+      a.href=url;
+      a.download=filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},200);
+    }
   };
 
   window.addEventListener('geaux:transcript',function(e){
