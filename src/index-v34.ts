@@ -1071,37 +1071,13 @@ kbd{
     var content=lines.join(String.fromCharCode(10));
     var yyyy=now.getFullYear(),mm=String(now.getMonth()+1).padStart(2,'0'),dd=String(now.getDate()).padStart(2,'0');
     var filename='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
-    var ua=navigator.userAgent||'';
-    var isAndroid=ua.indexOf('Android')!==-1;
-    var isWebView=(ua.indexOf('wv')!==-1)||(ua.indexOf('WebView')!==-1)||(isAndroid&&ua.indexOf('Version/')!==-1&&ua.indexOf('Chrome')===-1);
-    if(!isAndroid&&typeof window.showSaveFilePicker==='function'){
+    if(typeof window.showSaveFilePicker==='function'){
       window.showSaveFilePicker({
         suggestedName:filename,
         types:[{description:'Text File',accept:{'text/plain':['.txt']}}]
       }).then(function(fh){return fh.createWritable();})
         .then(function(w){return w.write(content).then(function(){return w.close();});})
-        .catch(function(err){if(err&&err.name!=='AbortError'){console.warn('showSaveFilePicker failed',err);}});
-    } else if(isAndroid){
-      try{
-        if(navigator.share&&typeof navigator.share==='function'){
-          var shareBlob=new Blob([content],{type:'text/plain'});
-          var shareFile=new File([shareBlob],filename,{type:'text/plain'});
-          if(navigator.canShare&&navigator.canShare({files:[shareFile]})){
-            navigator.share({files:[shareFile],title:filename}).catch(function(err){if(err&&err.name!=='AbortError'){console.warn('share failed',err);}});
-            return;
-          }
-        }
-      }catch(e){}
-      var blob=new Blob([content],{type:'text/plain'});
-      var url=URL.createObjectURL(blob);
-      var a=document.createElement('a');
-      a.href=url;
-      a.download=filename;
-      a.target='_blank';
-      a.rel='noopener';
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},500);
+        .catch(function(err){if(err&&err.name!=='AbortError'){console.warn('showSaveFilePicker failed, falling back',err);}});
     } else {
       var blob=new Blob([content],{type:'text/plain'});
       var url=URL.createObjectURL(blob);
