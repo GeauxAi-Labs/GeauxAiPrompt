@@ -1081,26 +1081,24 @@ kbd{
         .then(function(w){return w.write(content).then(function(){return w.close();});})
         .catch(function(err){if(err&&err.name!=='AbortError'){console.warn('showSaveFilePicker failed',err);}});
     } else {
-      var encoded=encodeURIComponent(content);
-      var dataUri='data:text/plain;charset=utf-8,'+encoded;
-      var w=window.open(dataUri,'_blank');
-      if(!w){
-        if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
-          navigator.clipboard.writeText(content).then(function(){
-            alert('Transcript copied to clipboard!');
-          }).catch(function(){
-            alert('Could not open or copy transcript. Try a different browser.');
-          });
-        } else {
-          var ta=document.createElement('textarea');
-          ta.value=content;
-          ta.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;opacity:.01;z-index:99999;';
-          document.body.appendChild(ta);
-          ta.focus();ta.select();
-          try{document.execCommand('copy');alert('Transcript copied to clipboard!');}catch(e){alert('Could not copy transcript.');}
-          document.body.removeChild(ta);
-        }
-      }
+      var authQ=window._authQuery||'';
+      fetch('/api/transcript-download'+(authQ?'?'+authQ:''),{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({content:content,filename:filename})
+      }).then(function(r){
+        if(!r.ok)throw new Error('Server error '+r.status);
+        return r.blob();
+      }).then(function(blob){
+        var url=URL.createObjectURL(blob);
+        var a=document.createElement('a');
+        a.href=url;
+        a.download=filename;
+        a.target='_blank';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},500);
+      }).catch(function(err){console.warn('transcript download failed',err);});
     }
   };
 
@@ -2076,6 +2074,23 @@ class GeauxAIApp extends AppServer {
 	{ voice_id: 'V2D1qkaFj5NormT9yoaK', name: 'Hoyeen' },
 	{ voice_id: 'TBvIh5TNCMX6pQNIcWV8', name: 'Chidiebere' },
       ]});
+    });
+
+    app.post('/api/transcript-download', (req: any, res: any) => {
+      try {
+        const { content, filename } = req.body as { content: string; filename: string };
+        if (!content || typeof content !== 'string') {
+          res.status(400).json({ error: 'No content provided' });
+          return;
+        }
+        const safeFilename = (filename || 'geauxai-transcript.txt').replace(/[^a-zA-Z0-9._-]/g, '_');
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+        res.setHeader('Cache-Control', 'no-store');
+        res.send(content);
+      } catch (e) {
+        res.status(500).json({ error: 'Download failed' });
+      }
     });
 
     app.get('/tts-audio/:id', (req: any, res: any) => {
