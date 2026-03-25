@@ -1073,6 +1073,7 @@ kbd{
     var filename='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
     var ua=navigator.userAgent||'';
     var isAndroid=ua.indexOf('Android')!==-1;
+    var isWebView=(ua.indexOf('wv')!==-1)||(ua.indexOf('WebView')!==-1)||(isAndroid&&ua.indexOf('Version/')!==-1&&ua.indexOf('Chrome')===-1);
     if(!isAndroid&&typeof window.showSaveFilePicker==='function'){
       window.showSaveFilePicker({
         suggestedName:filename,
@@ -1080,25 +1081,36 @@ kbd{
       }).then(function(fh){return fh.createWritable();})
         .then(function(w){return w.write(content).then(function(){return w.close();});})
         .catch(function(err){if(err&&err.name!=='AbortError'){console.warn('showSaveFilePicker failed',err);}});
+    } else if(isAndroid){
+      try{
+        if(navigator.share&&typeof navigator.share==='function'){
+          var shareBlob=new Blob([content],{type:'text/plain'});
+          var shareFile=new File([shareBlob],filename,{type:'text/plain'});
+          if(navigator.canShare&&navigator.canShare({files:[shareFile]})){
+            navigator.share({files:[shareFile],title:filename}).catch(function(err){if(err&&err.name!=='AbortError'){console.warn('share failed',err);}});
+            return;
+          }
+        }
+      }catch(e){}
+      var blob=new Blob([content],{type:'text/plain'});
+      var url=URL.createObjectURL(blob);
+      var a=document.createElement('a');
+      a.href=url;
+      a.download=filename;
+      a.target='_blank';
+      a.rel='noopener';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},500);
     } else {
-      var authQ=window._authQuery||'';
-      fetch('/api/transcript-download'+(authQ?'?'+authQ:''),{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({content:content,filename:filename})
-      }).then(function(r){
-        if(!r.ok)throw new Error('Server error '+r.status);
-        return r.blob();
-      }).then(function(blob){
-        var url=URL.createObjectURL(blob);
-        var a=document.createElement('a');
-        a.href=url;
-        a.download=filename;
-        a.target='_blank';
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},500);
-      }).catch(function(err){console.warn('transcript download failed',err);});
+      var blob=new Blob([content],{type:'text/plain'});
+      var url=URL.createObjectURL(blob);
+      var a=document.createElement('a');
+      a.href=url;
+      a.download=filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){document.body.removeChild(a);URL.revokeObjectURL(url);},200);
     }
   };
 
@@ -2074,23 +2086,6 @@ class GeauxAIApp extends AppServer {
 	{ voice_id: 'V2D1qkaFj5NormT9yoaK', name: 'Hoyeen' },
 	{ voice_id: 'TBvIh5TNCMX6pQNIcWV8', name: 'Chidiebere' },
       ]});
-    });
-
-    app.post('/api/transcript-download', (req: any, res: any) => {
-      try {
-        const { content, filename } = req.body as { content: string; filename: string };
-        if (!content || typeof content !== 'string') {
-          res.status(400).json({ error: 'No content provided' });
-          return;
-        }
-        const safeFilename = (filename || 'geauxai-transcript.txt').replace(/[^a-zA-Z0-9._-]/g, '_');
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-        res.setHeader('Cache-Control', 'no-store');
-        res.send(content);
-      } catch (e) {
-        res.status(500).json({ error: 'Download failed' });
-      }
     });
 
     app.get('/tts-audio/:id', (req: any, res: any) => {
