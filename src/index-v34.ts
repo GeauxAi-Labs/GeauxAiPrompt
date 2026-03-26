@@ -1682,28 +1682,7 @@ class GeauxAIApp extends AppServer {
     // Falls back to OWNER_EMAIL only when the webview is opened without a signed
     // token (e.g. direct browser hit during local dev) so the owner's dev workflow
     // is unchanged.
-    // resolveUser returns the authenticated userId, or null if not authenticated.
-    // OWNER_EMAIL fallback is only used in local dev (NODE_ENV !== 'production').
-    // In production, unauthenticated requests get null and are rejected by their handlers.
-    // DEPLOYMENT NOTE: Set NODE_ENV=production in your Oracle .env to enable the strict
-    // auth check. On GMKtec local dev, either leave NODE_ENV unset or set it to
-    // 'development' and keep OWNER_EMAIL set — the fallback still works locally.
-    const resolveUser = (req: any): string | null => {
-      // Priority 1: MentraOS SDK-verified token (glasses app / signed webview URL)
-      if (req.authUserId) return req.authUserId;
-      // Priority 2: Cloudflare Access OTP-verified email header.
-      // Cloudflare injects this after a user passes email OTP — it cannot be
-      // spoofed by clients because Cloudflare strips any client-sent Cf-Access-*
-      // headers before forwarding to the origin. Every browser user who passes
-      // Cloudflare OTP gets their own completely isolated session, history, and state.
-      const cfEmail = req.headers?.['cf-access-authenticated-user-email'];
-      if (cfEmail && typeof cfEmail === 'string' && cfEmail.includes('@')) {
-        return cfEmail.toLowerCase().trim();
-      }
-      // Priority 3: Local dev fallback — disabled in production
-      if (process.env.NODE_ENV !== 'production' && OWNER_EMAIL) return OWNER_EMAIL;
-      return null;
-    };
+    const resolveUser = (req: any): string => req.authUserId || OWNER_EMAIL;
 
     // Serve the live chat page.
     // The SDK auth middleware runs on every request and sets req.authUserId when token is valid.
@@ -1722,12 +1701,6 @@ class GeauxAIApp extends AppServer {
         return res.status(401).end(EXPIRED_PAGE_HTML);
       }
       const userId = resolveUser(req);
-      if (!userId) {
-        console.log('[Webview] No auth token — rejecting unauthenticated request');
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.status(401).end(EXPIRED_PAGE_HTML);
-      }
       const s = getState(userId);
       const html = buildPage(
         activeSessions.has(userId),
@@ -1942,10 +1915,6 @@ class GeauxAIApp extends AppServer {
     // GET /api/stream — client subscribes here; server pushes 'state' events
     app.get('/api/stream', (req: any, res: any) => {
       const userId = resolveUser(req);
-      if (!userId) {
-        console.log('[SSE] No auth token — rejecting unauthenticated stream request');
-        return res.status(401).end('');
-      }
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');

@@ -1689,18 +1689,7 @@ class GeauxAIApp extends AppServer {
     // auth check. On GMKtec local dev, either leave NODE_ENV unset or set it to
     // 'development' and keep OWNER_EMAIL set — the fallback still works locally.
     const resolveUser = (req: any): string | null => {
-      // Priority 1: MentraOS SDK-verified token (glasses app / signed webview URL)
       if (req.authUserId) return req.authUserId;
-      // Priority 2: Cloudflare Access OTP-verified email header.
-      // Cloudflare injects this after a user passes email OTP — it cannot be
-      // spoofed by clients because Cloudflare strips any client-sent Cf-Access-*
-      // headers before forwarding to the origin. Every browser user who passes
-      // Cloudflare OTP gets their own completely isolated session, history, and state.
-      const cfEmail = req.headers?.['cf-access-authenticated-user-email'];
-      if (cfEmail && typeof cfEmail === 'string' && cfEmail.includes('@')) {
-        return cfEmail.toLowerCase().trim();
-      }
-      // Priority 3: Local dev fallback — disabled in production
       if (process.env.NODE_ENV !== 'production' && OWNER_EMAIL) return OWNER_EMAIL;
       return null;
     };
