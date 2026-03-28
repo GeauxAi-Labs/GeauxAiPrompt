@@ -1051,7 +1051,6 @@ kbd{
   if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
   var bmTogEl=document.getElementById('p-browser-mic'); var bmTogHint=document.getElementById('p-browser-mic-hint');
   if(bmTogEl) bmTogEl.addEventListener('change',function(){ var on=bmTogEl.checked; if(bmTogHint) bmTogHint.textContent=on?'ON — browser mic active when offline':'OFF — browser mic disabled'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:on})}).catch(function(){}); if(on && !_glassesConnected){ _startBrowserMic(); } else { _stopBrowserMic(); } });
-  var micFormBtn=document.getElementById('sse-mic'); if(micFormBtn){ micFormBtn.closest('form').addEventListener('submit',function(ev){ if(_brEnabled){ ev.preventDefault(); fetch('/mic'+authQ,{method:'POST'}).catch(function(){}); } }); }
   var avTogEl=document.getElementById('p-avatar');
   var avTogHint=document.getElementById('p-avatar-hint');
   if(avTogEl) avTogEl.addEventListener('change',function(){
@@ -1427,7 +1426,6 @@ kbd{
   var _brEnabled        = false;
 
   function _startBrowserMic(){
-    _brEnabled = true;
     if(_browserMicActive) return;
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SR){ console.warn('[BrowserMic] SpeechRecognition not supported'); return; }
