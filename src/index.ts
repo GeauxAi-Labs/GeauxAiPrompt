@@ -489,7 +489,7 @@ kbd{
   min-height:38px;max-height:100px;
   transition:border-color .15s;-webkit-appearance:none;
 }
-.ft-inp:focus{border-color:var(--v2);background:#18122e}
+.ft-inp:focus{border-color:var(--v2);background:var(--bg3)}
 .ft-inp::placeholder{color:var(--tx3)}
 .ft-go{
   flex-shrink:0;width:38px;height:38px;
