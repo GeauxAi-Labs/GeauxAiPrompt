@@ -795,9 +795,21 @@ kbd{
   <div id="tlog-list" style="flex:1;overflow-y:auto;padding:12px 16px;">
     <div id="tlog-empty" style="text-align:center;color:var(--tx3);font-size:10px;padding:40px 0;letter-spacing:.06em;">No transcriptions yet this session</div>
   </div>
-  <div style="display:flex;gap:8px;padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom,16px));border-top:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
-    <button onclick="clearTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--r);">\uD83D\uDDD1 CLEAR</button>
-    <button onclick="saveTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--g2);">\uD83D\uDCBE SAVE .TXT</button>
+  <div id="ask-ai-pane" style="display:none;flex-direction:column;gap:10px;padding:14px 16px;flex:1;overflow-y:auto;">
+    <div style="font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.12em;color:var(--v3);">🤖 ASK AI ABOUT THIS TRANSCRIPT</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--tx3);line-height:1.5;" id="ask-ai-ctx-info"></div>
+    <div id="ask-ai-presets" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    <textarea id="ask-ai-input" placeholder="Ask anything about the transcript…" rows="3" style="width:100%;background:var(--bg3);color:var(--tx);border:1px solid var(--edge);border-radius:var(--rad);font-family:var(--mono);font-size:11px;line-height:1.55;padding:8px 10px;outline:none;resize:vertical;min-height:60px;"></textarea>
+    <div style="display:flex;gap:8px;">
+      <button type="button" onclick="closeAskAIPane()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--tx3);">← BACK</button>
+      <button id="ask-ai-submit" type="button" style="flex:2;padding:10px;background:var(--glass);border:1px solid var(--v2);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--v3);" onclick="submitAskAI()">🤖 SEND TO AI</button>
+    </div>
+  </div>
+  <div id="tlog-footer" style="display:flex;gap:6px;padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom,16px));border-top:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
+    <button onclick="clearTranscriptLog()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--r);">\uD83D\uDDD1 CLEAR</button>
+    <button onclick="saveTranscriptLog()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--g2);">\uD83D\uDCBE SAVE .TXT</button>
+    <button onclick="resetSpeakers()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--a);">🔄 RESET SPKRS</button>
+    <button onclick="openAskAIPane()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--v2);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--v3);">🤖 ASK AI</button>
   </div>
 </div>
 </div>
@@ -810,6 +822,10 @@ kbd{
   var pOpen=false;
   var transcriptLog=(function(){try{var s=localStorage.getItem('geaux_tlog');return s?JSON.parse(s):[];}catch(e){return [];}})();
   var overlayOpen=false;
+  var _nextSpeaker         = 1;
+  var _lastSpeaker         = 1;
+  var _speakerGapMs        = 3500;
+  var _speakerGapCalibrated = false;
 
   window.toggleP=function(){
     pOpen=!pOpen;
@@ -1027,19 +1043,43 @@ kbd{
     var empty=document.getElementById('tlog-empty');
     if(!list) return;
     list.querySelectorAll('.tlog-row').forEach(function(r){r.remove();});
+    var existSum=document.getElementById('tlog-summary');
+    if(existSum) existSum.remove();
     if(transcriptLog.length===0){if(empty) empty.style.display='block';return;}
     if(empty) empty.style.display='none';
+    // Speaker color palette
+    var spkrColors=['var(--v3)','var(--c2)','var(--g2)','var(--a)','#f472b6','var(--tx2)'];
+    function spkrColor(n){return (n>=1&&n<=5)?spkrColors[n-1]:spkrColors[5];}
+    // Summary bar
+    var spkrSet=new Set();
+    transcriptLog.forEach(function(e){if(e.speaker!==undefined) spkrSet.add(e.speaker);});
+    var maxGap=0;
+    for(var si=0;si<transcriptLog.length-1;si++){
+      var sg=Math.abs((transcriptLog[si].tsMs||0)-(transcriptLog[si+1].tsMs||0));
+      if(sg>maxGap) maxGap=sg;
+    }
+    var sumDiv=document.createElement('div');
+    sumDiv.id='tlog-summary';
+    sumDiv.style.cssText='font-family:var(--mono);font-size:8.5px;color:var(--tx3);padding:6px 0 10px;letter-spacing:.06em;border-bottom:1px solid var(--edge);margin-bottom:8px;';
+    sumDiv.textContent=spkrSet.size+(spkrSet.size!==1?' speakers':' speaker')+' detected · longest gap: '+maxGap+'ms · '+transcriptLog.length+(transcriptLog.length!==1?' utterances':' utterance');
+    list.insertBefore(sumDiv,list.firstChild);
+    // Rows
     transcriptLog.forEach(function(entry){
+      var spk=entry.speaker!==undefined?entry.speaker:1;
+      var color=spkrColor(spk);
       var row=document.createElement('div');
       row.className='tlog-row';
       row.style.cssText='padding:7px 0;border-bottom:1px solid var(--edge);font-size:10px;line-height:1.5;color:var(--tx);display:flex;gap:10px;align-items:flex-start;';
       var ts=document.createElement('span');
       ts.style.cssText='color:var(--v3);flex-shrink:0;font-size:9px;padding-top:1px;';
       ts.textContent='['+entry.ts+']';
+      var chip=document.createElement('span');
+      chip.style.cssText='font-size:8px;font-weight:700;letter-spacing:.10em;padding:1px 5px;border-radius:3px;border:1px solid '+color+'40;color:'+color+';background:'+color+'10;flex-shrink:0;margin-right:2px;';
+      chip.textContent='SPKR '+(entry.speaker!==undefined?entry.speaker:'?');
       var txt=document.createElement('span');
       txt.style.cssText='flex:1;word-break:break-word;';
       txt.textContent=entry.text;
-      row.appendChild(ts);row.appendChild(txt);
+      row.appendChild(ts);row.appendChild(chip);row.appendChild(txt);
       list.appendChild(row);
     });
   }
@@ -1067,7 +1107,7 @@ kbd{
     var now=new Date();
     var header='GeauxAI Transcription Log \u2014 '+now.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})+' '+now.toLocaleTimeString('en-US');
     var lines=[header,'\u2500'.repeat(50),''];
-    transcriptLog.slice().reverse().forEach(function(e){lines.push('['+e.ts+'] '+e.text);});
+    transcriptLog.slice().reverse().forEach(function(e){lines.push('['+e.ts+'] [SPKR '+(e.speaker!==undefined?e.speaker:'?')+'] '+e.text);});
     var content=lines.join(String.fromCharCode(10));
     var yyyy=now.getFullYear(),mm=String(now.getMonth()+1).padStart(2,'0'),dd=String(now.getDate()).padStart(2,'0');
     var filename='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
@@ -1091,15 +1131,146 @@ kbd{
   };
 
   window.addEventListener('geaux:transcript',function(e){
-    transcriptLog.unshift({ts:e.detail.ts,text:e.detail.text});
+    var tsMs = Date.now();
+    var ts = e.detail.ts;
+    var text = e.detail.text;
+    var speaker;
+    if(transcriptLog.length === 0){
+      speaker = 1;
+      _lastSpeaker = 1;
+      _nextSpeaker = 2;
+    } else {
+      var prev = transcriptLog[0];
+      var gapMs = tsMs - (prev.tsMs || 0);
+      if(gapMs > _speakerGapMs){
+        speaker = _nextSpeaker;
+        _lastSpeaker = _nextSpeaker;
+        _nextSpeaker++;
+      } else {
+        speaker = _lastSpeaker;
+      }
+    }
+    transcriptLog.unshift({ts:ts, text:text, speaker:speaker, tsMs:tsMs});
     tlogSave();
     tlogUpdateCount();
     if(overlayOpen) tlogRender();
+    // AI calibration: fire once after 5th entry
+    if(transcriptLog.length === 5 && !_speakerGapCalibrated){
+      _speakerGapCalibrated = true;
+      var reversed = transcriptLog.slice().reverse();
+      var calEntries = reversed.map(function(en, i){
+        var gap = i === 0 ? 0 : Math.abs((en.tsMs||0) - (reversed[i-1].tsMs||0));
+        return {ts: en.ts, text: en.text, gapMs: gap};
+      });
+      fetch('/api/calibrate-speaker-gap'+authQ,{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({entries:calEntries})
+      }).then(function(r){return r.ok?r.json():null;})
+        .then(function(d){
+          if(d && typeof d.gapMs === 'number'){
+            _speakerGapMs = d.gapMs;
+            console.log('[SpeakerCalib] gap set to', d.gapMs, 'ms');
+          }
+        }).catch(function(){});
+    }
   });
 
   // Auto-resize textarea
   var inp=document.getElementById('ft-inp');
   if(inp) inp.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px';});
+
+  // ── Speaker diarization helpers ───────────────────────────────────────
+  window.resetSpeakers = function(){
+    _nextSpeaker = 1;
+    _lastSpeaker = 1;
+    _speakerGapCalibrated = false;
+    _speakerGapMs = 3500;
+    console.log('[Speaker] Reset to Speaker 1');
+  };
+
+  // ── Ask AI about transcript ───────────────────────────────────────────
+  window.openAskAIPane = function(){
+    var pane = document.getElementById('ask-ai-pane');
+    var tll  = document.getElementById('tlog-list');
+    var tfoot= document.getElementById('tlog-footer');
+    if(!pane) return;
+    // Populate context info
+    var spkSet=new Set();
+    transcriptLog.forEach(function(e){if(e.speaker!==undefined) spkSet.add(e.speaker);});
+    var oldest = transcriptLog.length ? transcriptLog[transcriptLog.length-1].ts : '—';
+    var newest = transcriptLog.length ? transcriptLog[0].ts : '—';
+    var info = document.getElementById('ask-ai-ctx-info');
+    if(info) info.textContent = transcriptLog.length+' entries · '+spkSet.size+' speaker(s) detected · '+oldest+' → '+newest;
+    // Preset chips
+    var presetsEl = document.getElementById('ask-ai-presets');
+    if(presetsEl){
+      presetsEl.innerHTML='';
+      var presets=['Summarize this conversation','What were the key decisions?','List action items','Who spoke the most?','What topics were discussed?','Draft follow-up email'];
+      presets.forEach(function(p){
+        var chip=document.createElement('button');
+        chip.type='button';
+        chip.style.cssText='font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.07em;padding:5px 10px;border-radius:99px;border:1px solid var(--v2)40;color:var(--v3);background:var(--v)10;cursor:pointer;';
+        chip.textContent=p;
+        chip.onclick=function(){
+          var ta=document.getElementById('ask-ai-input');
+          if(ta) ta.value=p;
+        };
+        presetsEl.appendChild(chip);
+      });
+    }
+    // Default value
+    var ta=document.getElementById('ask-ai-input');
+    if(ta) ta.value='Summarize this conversation';
+    // Show pane, hide list and footer
+    pane.style.display='flex';
+    if(tll) tll.style.display='none';
+    if(tfoot) tfoot.style.display='none';
+    if(ta) ta.focus();
+  };
+
+  window.submitAskAI = function(){
+    var question = (document.getElementById('ask-ai-input')||{}).value;
+    if(!question || !question.trim()) return;
+    question = question.trim();
+    var btn = document.getElementById('ask-ai-submit');
+    if(btn){ btn.disabled=true; btn.textContent='⏳ Sending…'; }
+    // Build chronological transcript (log is newest-first, so reverse it)
+    var entries = transcriptLog.slice().reverse();
+    var lines = entries.map(function(e){
+      return '['+e.ts+'] [SPKR '+(e.speaker||'?')+'] '+e.text;
+    });
+    var startTs = entries.length ? entries[0].ts : '';
+    var endTs   = entries.length ? entries[entries.length-1].ts : '';
+    var spkCount=new Set(entries.map(function(e){return e.speaker;})).size;
+    var contextBlock =
+      '[TRANSCRIPT '+startTs+'→'+endTs+
+      ' | '+entries.length+' utterances | '+spkCount+' speaker(s)]\n'+
+      lines.join('\n')+
+      '\n[END TRANSCRIPT]';
+    var fullPrompt = contextBlock+'\n\n'+question;
+    fetch('/prompt'+authQ,{
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'text='+encodeURIComponent(fullPrompt)
+    }).then(function(){
+      window.closeAskAIPane();
+      window.closeTranscriptLog();
+    }).catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='🤖 SEND TO AI';}
+    });
+  };
+
+  window.closeAskAIPane = function(){
+    var pane  = document.getElementById('ask-ai-pane');
+    var tll   = document.getElementById('tlog-list');
+    var tfoot = document.getElementById('tlog-footer');
+    var btn   = document.getElementById('ask-ai-submit');
+    if(pane)  pane.style.display  = 'none';
+    if(tll)   tll.style.display   = 'block';
+    if(tfoot) tfoot.style.display = 'flex';
+    if(btn){btn.disabled=false;btn.textContent='🤖 SEND TO AI';}
+  };
 
   // AJAX send (no page reload)
   var btn=document.getElementById('ft-go');
@@ -2110,7 +2281,34 @@ class GeauxAIApp extends AppServer {
     app.get('/webview', serve);
     app.get('/health', (_req: any, res: any) => res.json({ status: 'healthy' }));
 
-    console.log('[Routes] / /webview /health /clear /mic /prompt /upload /api/params /api/models /api/stream /tts-audio/:id registered');
+    // ── Speaker gap calibration ───────────────────────────────────────────────
+    app.post('/api/calibrate-speaker-gap', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      if (!userId) return res.json({ gapMs: 3500 });
+      const s = getState(userId);
+      const entries: { ts: string; text: string; gapMs: number }[] = req.body?.entries || [];
+      if (!entries.length) return res.json({ gapMs: 3500 });
+      try {
+        const listing = entries.map((e, i) =>
+          `${i + 1}. [${e.ts}] (gap: ${e.gapMs}ms) ${e.text}`
+        ).join('\n');
+        const prompt = `You are analyzing a voice transcript from smart glasses to calibrate speaker diarization.\nHere are the first 5 utterances with the silence gap before each:\n${listing}\nBased on the rhythm of this conversation (interview, meeting, monologue, Q&A, etc.),\nwhat silence gap in milliseconds best indicates a speaker change?\nReply with ONLY a JSON object: { "gapMs": <number between 1500 and 8000> }\nNo explanation, no markdown, just the JSON.`;
+        const raw = await callAI([{ role: 'user', content: prompt }], s.genParams);
+        // Extract the JSON from the response
+        const match = raw.match(/\{[^}]+\}/);
+        if (!match) throw new Error('No JSON in response');
+        const parsed = JSON.parse(match[0]);
+        let gapMs = typeof parsed.gapMs === 'number' ? parsed.gapMs : 3500;
+        gapMs = Math.max(1500, Math.min(8000, Math.round(gapMs)));
+        console.log(`[SpeakerCalib] ${userId} calibrated gap to ${gapMs}ms`);
+        return res.json({ gapMs });
+      } catch (err: any) {
+        console.log(`[SpeakerCalib] ${userId} calibration error: ${err.message} — using default`);
+        return res.json({ gapMs: 3500 });
+      }
+    });
+
+    console.log('[Routes] / /webview /health /clear /mic /prompt /upload /api/params /api/models /api/stream /tts-audio/:id /api/calibrate-speaker-gap registered');
   }
 }
 
