@@ -459,11 +459,7 @@ kbd{
   padding:9px 12px;border-radius:10px;
   font-size:13.5px;line-height:1.6;word-break:break-word;
 }
-.msg-u .msg-body{
-  background:linear-gradient(135deg,#2a1a4a,#1a0e38);
-  border:1px solid #7c3aed28;border-bottom-right-radius:3px;
-  max-width:90%;align-self:flex-end;
-}
+.msg-u .msg-body { background: #7c3aed; color: #ffffff; border-bottom-right-radius: 3px; max-width: 90%; align-self: flex-end; }
 .msg-a .msg-body{
   background:var(--glass);border:1px solid var(--edge);
   border-bottom-left-radius:3px;max-width:94%;
