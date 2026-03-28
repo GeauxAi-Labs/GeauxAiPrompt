@@ -44,8 +44,7 @@ interface GenParams {
   elevenDirectVoiceId:  string;
   elevenPathPref:    'mentraos' | 'geauxai';
   kokoroVoice: string;
-  avatarEnabled:     boolean;
-  browserMicEnabled: boolean;
+  avatarEnabled: boolean;
 }
 
 interface UserState {
@@ -91,8 +90,7 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   elevenDirectVoiceId: '',
   elevenPathPref:    'mentraos' as 'mentraos' | 'geauxai',
   kokoroVoice: '',
-  avatarEnabled:     true,
-  browserMicEnabled: false,
+  avatarEnabled: true,
 };
 
 DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
@@ -578,7 +576,6 @@ kbd{
         window.location.reload();
       }
     }
-    document.dispatchEvent(new CustomEvent('geaux:stateupdate',{detail:d}));
   }
 
   function applyListening(d){
@@ -758,13 +755,6 @@ kbd{
       </div>
     </div>
     <div class="p-row">
-      <span class="p-lbl">BROWSER MIC <span class="p-hint">— enable browser microphone when glasses are offline. No wake word needed. Sends speech directly to AI.</span></span>
-      <div class="p-tog-row">
-        <label class="tsw"><input type="checkbox" id="p-browser-mic"><span class="ttrack"></span></label>
-        <span class="thint" id="p-browser-mic-hint">OFF — browser mic disabled</span>
-      </div>
-    </div>
-    <div class="p-row">
       <span class="p-lbl">TTS AVATAR <span class="p-hint">— show/hide the floating avatar during TTS playback</span></span>
       <div class="p-tog-row">
         <label class="tsw"><input type="checkbox" id="p-avatar" checked><span class="ttrack"></span></label>
@@ -885,7 +875,6 @@ kbd{
         elevenDirectVoiceId:document.getElementById('p-eleven-direct-voice')?document.getElementById('p-eleven-direct-voice').value:'',
         kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
         ,avatarEnabled:avatarEl?!!avatarEl.checked:true
-        ,browserMicEnabled:document.getElementById('p-browser-mic')?!!document.getElementById('p-browser-mic').checked:false
       })
     }).catch(function(){});
   }
@@ -1005,7 +994,6 @@ kbd{
         avatarEl.checked=!!d.avatarEnabled;
         if(avatarHint) avatarHint.textContent=d.avatarEnabled?'ON — avatar appears during speech':'OFF — avatar hidden';
       }
-      var bmEl=document.getElementById('p-browser-mic'); var bmHint=document.getElementById('p-browser-mic-hint'); if(bmEl&&d.browserMicEnabled!==undefined){bmEl.checked=!!d.browserMicEnabled; if(bmHint) bmHint.textContent=d.browserMicEnabled?'ON — browser mic active when offline':'OFF — browser mic disabled';}
     }).catch(function(){});
 
   var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
@@ -1049,8 +1037,6 @@ kbd{
   var elevDirectVoiceEl=document.getElementById('p-eleven-direct-voice'); if(elevDirectVoiceEl) elevDirectVoiceEl.addEventListener('change',sendParams);
   var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
   if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
-  var bmTogEl=document.getElementById('p-browser-mic'); var bmTogHint=document.getElementById('p-browser-mic-hint');
-  if(bmTogEl) bmTogEl.addEventListener('change',function(){ var on=bmTogEl.checked; if(bmTogHint) bmTogHint.textContent=on?'ON — browser mic active when offline':'OFF — browser mic disabled'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:on})}).catch(function(){}); if(on && !_glassesConnected){ _startBrowserMic(); } else { _stopBrowserMic(); } });
   var avTogEl=document.getElementById('p-avatar');
   var avTogHint=document.getElementById('p-avatar-hint');
   if(avTogEl) avTogEl.addEventListener('change',function(){
@@ -1416,59 +1402,6 @@ kbd{
   }
   if(btn) btn.addEventListener('click',doSend);
   if(inp) inp.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend();}});
-
-  // ── Browser Mic (Web Speech API) — offline path ───────────────────
-  var _glassesConnected = false;
-  var _browserMicActive = false;
-  var _browserMicMuted  = false;
-  var _brRecog          = null;
-  var _brRestarting     = false;
-  var _brEnabled        = false;
-
-  function _startBrowserMic(){
-    if(_browserMicActive) return;
-    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if(!SR){ console.warn('[BrowserMic] SpeechRecognition not supported'); return; }
-    if(_brRecog){ try{ _brRecog.abort(); }catch(e){} _brRecog=null; }
-    var r = new SR();
-    r.continuous = true;
-    r.interimResults = true;
-    r.lang = 'en-US';
-    r.onstart = function(){ _browserMicActive=true; console.log('[BrowserMic] started'); };
-    r.onend = function(){ _browserMicActive=false; if(_brEnabled && !_glassesConnected && !_browserMicMuted && !_brRestarting){ _brRestarting=true; setTimeout(function(){ _brRestarting=false; _startBrowserMic(); }, 300); } };
-    r.onerror = function(ev){ console.warn('[BrowserMic] error:', ev.error); _browserMicActive=false; if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){ _brEnabled=false; var bm=document.getElementById('p-browser-mic'); if(bm) bm.checked=false; var bh=document.getElementById('p-browser-mic-hint'); if(bh) bh.textContent='OFF — microphone permission denied'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:false})}).catch(function(){}); } };
-    r.onresult = function(ev){
-      if(_browserMicMuted || _glassesConnected) return;
-      var interim=''; var final_='';
-      for(var i=ev.resultIndex;i<ev.results.length;i++){ if(ev.results[i].isFinal){ final_+=ev.results[i][0].transcript; } else { interim+=ev.results[i][0].transcript; } }
-      if(interim){ var lb=document.getElementById('lbar'); var lt=document.getElementById('ltxt'); if(lb) lb.style.display='flex'; if(lt) lt.textContent=interim; }
-      if(final_.trim()){ var now3=new Date(); var ts3=now3.toTimeString().slice(0,8); var lb2=document.getElementById('lbar'); if(lb2) lb2.style.display='none'; var lt2=document.getElementById('ltxt'); if(lt2) lt2.textContent=''; console.log('[BrowserMic] final: '+final_.trim()); window.dispatchEvent(new CustomEvent('geaux:transcript',{detail:{ts:ts3,text:final_.trim()}})); fetch('/prompt'+authQ,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text='+encodeURIComponent(final_.trim())}).catch(function(){}); }
-    };
-    _brRecog = r;
-    try{ r.start(); } catch(e){ console.warn('[BrowserMic] start failed:',e); }
-  }
-
-  function _stopBrowserMic(){
-    _brEnabled=false;
-    _brRestarting=false;
-    _browserMicActive=false;
-    if(_brRecog){ try{ _brRecog.abort(); }catch(e){} _brRecog=null; }
-    var lb=document.getElementById('lbar'); if(lb) lb.style.display='none';
-    console.log('[BrowserMic] stopped');
-  }
-
-  // Hook into SSE state to track glasses connection and mute state
-  var _origApplyState = window._applyStateFn || null;
-  document.addEventListener('geaux:stateupdate', function(ev){
-    var d = ev.detail;
-    var wasConnected = _glassesConnected;
-    _glassesConnected = !!d.connected;
-    _browserMicMuted  = !!d.micMuted;
-    // Glasses just connected — stop browser mic immediately
-    if(!wasConnected && _glassesConnected && _browserMicActive){ _stopBrowserMic(); console.log('[BrowserMic] glasses connected — stopped browser mic'); }
-    // Glasses just disconnected — restart browser mic if enabled
-    if(wasConnected && !_glassesConnected && _brEnabled && !_browserMicMuted){ _startBrowserMic(); }
-  });
 
   // Scroll feed to bottom
   var feed=document.getElementById('feed');
@@ -2310,8 +2243,6 @@ class GeauxAIApp extends AppServer {
         s.genParams.kokoroVoice = b.kokoroVoice;
       if (typeof b.avatarEnabled === 'boolean')
         s.genParams.avatarEnabled = b.avatarEnabled;
-      if (typeof b.browserMicEnabled === 'boolean')
-        s.genParams.browserMicEnabled = b.browserMicEnabled;
       console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
       const sess = activeSessions.get(userId);
       if (sess) {
@@ -2531,7 +2462,6 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
       if (typeof prefs.genParams.elevenDirectVoiceId === 'string') s.genParams.elevenDirectVoiceId = prefs.genParams.elevenDirectVoiceId;
       if (typeof prefs.genParams.kokoroVoice === 'string') s.genParams.kokoroVoice = prefs.genParams.kokoroVoice;
       if (typeof prefs.genParams.avatarEnabled === 'boolean') s.genParams.avatarEnabled = prefs.genParams.avatarEnabled;
-      if (typeof prefs.genParams.browserMicEnabled === 'boolean') s.genParams.browserMicEnabled = prefs.genParams.browserMicEnabled;
     }
     console.log(`[Storage] Loaded prefs for ${userId}: tts=${s.ttsEnabled} engine=${s.ttsEngine} mic=${s.micMuted ? 'off' : 'on'}`);
   } catch (err: any) {
