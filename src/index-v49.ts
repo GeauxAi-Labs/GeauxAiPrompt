@@ -276,16 +276,6 @@ function buildPage(
   --ui:'Syne',sans-serif;
   --rad:12px;
 }
-[data-theme="light"]{
-  --bg:#f5f3ff;--bg2:#ede9fe;--bg3:#ffffff;
-  --glass:#7c3aed0a;--glass2:#7c3aed14;
-  --edge:#7c3aed1a;--edge2:#7c3aed28;
-  --v:#7c3aed;--v2:#a855f7;--v3:#6d28d9;
-  --c:#0891b2;--c2:#0e7490;
-  --g:#059669;--g2:#047857;
-  --a:#d97706;--r:#dc2626;
-  --tx:#1e1b4b;--tx2:#4c1d95;--tx3:#7c3aed;
-}
 html{height:100%;-webkit-text-size-adjust:100%}
 body{
   min-height:100%;background:var(--bg);color:var(--tx);font-family:var(--ui);
@@ -294,7 +284,6 @@ body{
     radial-gradient(ellipse 40% 25% at 85% 75%,#0a3d4a14 0%,transparent 55%);
   background-attachment:fixed;
 }
-[data-theme="light"] body{background-image:radial-gradient(ellipse 70% 40% at 50% 0%,#7c3aed12 0%,transparent 65%),radial-gradient(ellipse 40% 25% at 85% 75%,#0891b20e 0%,transparent 55%)}
 .shell{display:flex;flex-direction:column;min-height:100dvh;max-width:540px;margin:0 auto}
 
 /* Header */
@@ -336,7 +325,6 @@ body{
 .chip-engine{border-color:var(--v2);color:var(--v3)}
 .chip-x{border-color:var(--edge);color:var(--tx3)}
 .chip-x:active{background:var(--glass);border-color:#ef444460;color:var(--r)}
-.chip-theme{border-color:var(--edge);color:var(--tx2);font-size:12px;padding:3px 7px}
 
 /* Status bar */
 .sbar{
@@ -596,7 +584,6 @@ kbd{
   }
 
   function _refreshFeed(){ fetch('/webview',{credentials:'include'}).then(function(r){return r.ok?r.text():null;}).then(function(html){ if(!html) return; var doc=(new DOMParser()).parseFromString(html,'text/html'); var nf=doc.getElementById('feed'); var cf=document.getElementById('feed'); if(nf&&cf){ cf.innerHTML=nf.innerHTML; cf.scrollTop=cf.scrollHeight; } var ns=doc.querySelector('.scount'); var sbar=document.querySelector('.sbar'); if(sbar){ var os=sbar.querySelector('.scount'); if(ns&&os) os.outerHTML=ns.outerHTML; else if(ns&&!os){ var logBtn=document.getElementById('sbar-log-btn'); if(logBtn) sbar.insertBefore(ns.cloneNode(true),logBtn); } else if(!ns&&os) os.remove(); } }).catch(function(){}); }
-  window._refreshFeed = _refreshFeed;
 
   function applyListening(d){
     var bar=document.getElementById('lbar');
@@ -717,7 +704,6 @@ kbd{
     <form method="POST" action="/clear" style="margin:0">
       <button type="submit" class="chip chip-x">✕ CLEAR</button>
     </form>
-    <button class="chip chip-theme" id="chip-theme" onclick="toggleTheme()" title="Toggle light/dark theme">🌙</button>
   </div>
 </header>
 
@@ -1079,9 +1065,6 @@ kbd{
     fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({avatarEnabled:on})}).catch(function(){});
   });
 
-  window.toggleTheme=function(){ var html=document.documentElement; var isLight=html.getAttribute('data-theme')==='light'; html.setAttribute('data-theme',isLight?'dark':'light'); var btn=document.getElementById('chip-theme'); if(btn) btn.textContent=isLight?'🌙':'☀️'; try{localStorage.setItem('geauxai-theme',isLight?'dark':'light');}catch(e){} };
-  (function(){ try{ var t=localStorage.getItem('geauxai-theme'); if(t==='light'){ document.documentElement.setAttribute('data-theme','light'); var btn=document.getElementById('chip-theme'); if(btn) btn.textContent='☀️'; } }catch(e){} })();
-
   window.toggleTTSEngine=function(){
     fetch('/tts-engine'+authQ,{method:'POST'})
       .then(function(r){return r.json();})
@@ -1170,7 +1153,7 @@ kbd{
     overlayOpen=false;window._transcriptOverlayOpen=false;
     var ov=document.getElementById('transcript-overlay');
     if(ov){ov.style.transform='translateY(100%)';ov.style.pointerEvents='none';}
-    if(window._pendingReloadWhileOverlay){window._pendingReloadWhileOverlay=false;if(window._brMicRunning&&window._refreshFeed){window._refreshFeed();}else{window.location.reload();}}
+    if(window._pendingReloadWhileOverlay){window._pendingReloadWhileOverlay=false;window.location.reload();}
   };
 
   window.clearTranscriptLog=function(){
