@@ -1428,33 +1428,30 @@ kbd{
   var _brRestarting     = false;
   var _brEnabled        = false;
   var _brLastSent       = '';
-  var _brLastSentTime   = 0;
-  var _brNoSpeechBackoff = false;
-  var _brAborted        = false;
 
   function _startBrowserMic(){
     _brEnabled = true; window._brMicRunning = true;
     if(_browserMicActive) return;
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SR){ console.warn('[BrowserMic] SpeechRecognition not supported'); return; }
-    if(_brRecog){ try{ _brRecog.stop(); }catch(e){} _brRecog=null; }
+    if(_brRecog){ try{ _brRecog.abort(); }catch(e){} _brRecog=null; }
     var r = new SR();
-    r.continuous = false;
+    r.continuous = true;
     r.interimResults = true;
     r.lang = 'en-US';
-    r.onstart = function(){ _browserMicActive=true; _brNoSpeechBackoff=false; _brAborted=false; console.log('[BrowserMic] started'); };
-    r.onerror = function(ev){ _browserMicActive=false; if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){ console.warn('[BrowserMic] permission denied'); _brEnabled=false; window._brMicRunning=false; var bm=document.getElementById('p-browser-mic'); if(bm) bm.checked=false; var bh=document.getElementById('p-browser-mic-hint'); if(bh) bh.textContent='OFF \u2014 microphone permission denied'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:false})}).catch(function(){}); } else if(ev.error==='no-speech'){ _brNoSpeechBackoff=true; } else if(ev.error==='aborted'){ _brAborted=true; } else { console.warn('[BrowserMic] error:',ev.error); } };
-    r.onend = function(){ _browserMicActive=false; _brRecog=null; if(!_brEnabled || _glassesConnected || _browserMicMuted || _brRestarting) return; _brRestarting=true; var delay=_brNoSpeechBackoff?1500:(_brAborted?500:250); _brNoSpeechBackoff=false; _brAborted=false; setTimeout(function(){ _brRestarting=false; if(_brEnabled && !_glassesConnected && !_browserMicMuted) _startBrowserMic(); }, delay); };
-    r.onresult = function(ev){ if(_browserMicMuted||_glassesConnected) return; var interim=''; var final_=''; for(var i=ev.resultIndex;i<ev.results.length;i++){ if(ev.results[i].isFinal){ final_+=ev.results[i][0].transcript; } else { interim+=ev.results[i][0].transcript; } } if(interim.trim()){ var lb=document.getElementById('lbar'); var lt=document.getElementById('ltxt'); if(lb) lb.style.display='flex'; if(lt) lt.textContent=interim; } if(final_.trim()){ var now3=new Date(); var nowMs=now3.getTime(); if(final_.trim()===_brLastSent && nowMs-_brLastSentTime<4000) return; _brLastSent=final_.trim(); _brLastSentTime=nowMs; var ts3=now3.toTimeString().slice(0,8); var lb2=document.getElementById('lbar'); if(lb2) lb2.style.display='none'; var lt2=document.getElementById('ltxt'); if(lt2) lt2.textContent=''; console.log('[BrowserMic] final: '+final_.trim()); window.dispatchEvent(new CustomEvent('geaux:transcript',{detail:{ts:ts3,text:final_.trim()}})); fetch('/prompt'+authQ,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text='+encodeURIComponent(final_.trim())}).catch(function(){}); } };
+    r.onstart = function(){ _browserMicActive=true; _brLastSent=''; console.log('[BrowserMic] started'); };
+    r.onend = function(){ _browserMicActive=false; _brRecog=null; if(_brEnabled && !_glassesConnected && !_browserMicMuted && !_brRestarting){ _brRestarting=true; setTimeout(function(){ _brRestarting=false; _startBrowserMic(); }, 300); } };
+    r.onerror = function(ev){ console.warn('[BrowserMic] error:', ev.error); _browserMicActive=false; if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){ _brEnabled=false; var bm=document.getElementById('p-browser-mic'); if(bm) bm.checked=false; var bh=document.getElementById('p-browser-mic-hint'); if(bh) bh.textContent='OFF — microphone permission denied'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:false})}).catch(function(){}); } };
+    r.onresult = function(ev){ if(_browserMicMuted || _glassesConnected) return; var interim=''; var final_=''; for(var i=ev.resultIndex;i<ev.results.length;i++){ if(ev.results[i].isFinal){ final_+=ev.results[i][0].transcript; } else { interim+=ev.results[i][0].transcript; } } if(interim){ var lb=document.getElementById('lbar'); var lt=document.getElementById('ltxt'); if(lb) lb.style.display='flex'; if(lt) lt.textContent=interim; } if(final_.trim() && final_.trim()!==_brLastSent){ _brLastSent=final_.trim(); var now3=new Date(); var ts3=now3.toTimeString().slice(0,8); var lb2=document.getElementById('lbar'); if(lb2) lb2.style.display='none'; var lt2=document.getElementById('ltxt'); if(lt2) lt2.textContent=''; console.log('[BrowserMic] final: '+final_.trim()); window.dispatchEvent(new CustomEvent('geaux:transcript',{detail:{ts:ts3,text:final_.trim()}})); fetch('/prompt'+authQ,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text='+encodeURIComponent(final_.trim())}).catch(function(){}); } };
     _brRecog = r;
-    try{ r.start(); } catch(e){ console.warn('[BrowserMic] start failed:',e); _browserMicActive=false; }
+    try{ r.start(); } catch(e){ console.warn('[BrowserMic] start failed:',e); }
   }
 
   function _stopBrowserMic(){
     _brEnabled=false; window._brMicRunning=false;
-    _brRestarting=false; _brNoSpeechBackoff=false; _brAborted=false;
+    _brRestarting=false;
     _browserMicActive=false;
-    if(_brRecog){ try{ _brRecog.stop(); }catch(e){} _brRecog=null; }
+    if(_brRecog){ try{ _brRecog.abort(); }catch(e){} _brRecog=null; }
     var lb=document.getElementById('lbar'); if(lb) lb.style.display='none';
     console.log('[BrowserMic] stopped');
   }
