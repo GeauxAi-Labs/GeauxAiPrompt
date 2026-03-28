@@ -575,15 +575,13 @@ kbd{
       } else if(inp && inp.value.trim().length>0){
         inp.dataset.pendingReload='1';
       } else if(window._brMicRunning){
-        _refreshFeed();
+        window._pendingReloadWhileOverlay=true;
       } else {
         window.location.reload();
       }
     }
     document.dispatchEvent(new CustomEvent('geaux:stateupdate',{detail:d}));
   }
-
-  function _refreshFeed(){ fetch('/webview',{credentials:'include'}).then(function(r){return r.ok?r.text():null;}).then(function(html){ if(!html) return; var doc=(new DOMParser()).parseFromString(html,'text/html'); var nf=doc.getElementById('feed'); var cf=document.getElementById('feed'); if(nf&&cf){ cf.innerHTML=nf.innerHTML; cf.scrollTop=cf.scrollHeight; } var ns=doc.querySelector('.scount'); var sbar=document.querySelector('.sbar'); if(sbar){ var os=sbar.querySelector('.scount'); if(ns&&os) os.outerHTML=ns.outerHTML; else if(ns&&!os){ var logBtn=document.getElementById('sbar-log-btn'); if(logBtn) sbar.insertBefore(ns.cloneNode(true),logBtn); } else if(!ns&&os) os.remove(); } }).catch(function(){}); }
 
   function applyListening(d){
     var bar=document.getElementById('lbar');
