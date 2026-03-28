@@ -1051,7 +1051,7 @@ kbd{
   if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
   var bmTogEl=document.getElementById('p-browser-mic'); var bmTogHint=document.getElementById('p-browser-mic-hint');
   if(bmTogEl) bmTogEl.addEventListener('change',function(){ var on=bmTogEl.checked; if(bmTogHint) bmTogHint.textContent=on?'ON — browser mic active when offline':'OFF — browser mic disabled'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:on})}).catch(function(){}); if(on && !_glassesConnected){ _startBrowserMic(); } else { _stopBrowserMic(); } });
-  var micFormBtn=document.getElementById('sse-mic'); if(micFormBtn){ micFormBtn.closest('form').addEventListener('submit',function(ev){ if(_brEnabled){ ev.preventDefault(); var isMuted=micFormBtn.classList.contains('muted'); micFormBtn.classList.toggle('muted',!isMuted); micFormBtn.textContent=isMuted?'🎤 MIC ON':'🔇 MUTED'; fetch('/mic'+authQ,{method:'POST'}).catch(function(){}); } }); }
+  var micFormBtn=document.getElementById('sse-mic'); if(micFormBtn){ micFormBtn.closest('form').addEventListener('submit',function(ev){ if(_brEnabled){ ev.preventDefault(); fetch('/mic'+authQ,{method:'POST'}).catch(function(){}); } }); }
   var avTogEl=document.getElementById('p-avatar');
   var avTogHint=document.getElementById('p-avatar-hint');
   if(avTogEl) avTogEl.addEventListener('change',function(){
@@ -1425,7 +1425,6 @@ kbd{
   var _brRecog          = null;
   var _brRestarting     = false;
   var _brEnabled        = false;
-  var _brLastSent       = '';
 
   function _startBrowserMic(){
     _brEnabled = true;
@@ -1437,10 +1436,16 @@ kbd{
     r.continuous = true;
     r.interimResults = true;
     r.lang = 'en-US';
-    r.onstart = function(){ _browserMicActive=true; _brLastSent=''; console.log('[BrowserMic] started'); };
-    r.onend = function(){ _browserMicActive=false; _brRecog=null; if(_brEnabled && !_glassesConnected && !_browserMicMuted && !_brRestarting){ _brRestarting=true; setTimeout(function(){ _brRestarting=false; _startBrowserMic(); }, 300); } };
+    r.onstart = function(){ _browserMicActive=true; console.log('[BrowserMic] started'); };
+    r.onend = function(){ _browserMicActive=false; if(_brEnabled && !_glassesConnected && !_browserMicMuted && !_brRestarting){ _brRestarting=true; setTimeout(function(){ _brRestarting=false; _startBrowserMic(); }, 300); } };
     r.onerror = function(ev){ console.warn('[BrowserMic] error:', ev.error); _browserMicActive=false; if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){ _brEnabled=false; var bm=document.getElementById('p-browser-mic'); if(bm) bm.checked=false; var bh=document.getElementById('p-browser-mic-hint'); if(bh) bh.textContent='OFF — microphone permission denied'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:false})}).catch(function(){}); } };
-    r.onresult = function(ev){ if(_browserMicMuted || _glassesConnected) return; var interim=''; var final_=''; for(var i=ev.resultIndex;i<ev.results.length;i++){ if(ev.results[i].isFinal){ final_+=ev.results[i][0].transcript; } else { interim+=ev.results[i][0].transcript; } } if(interim){ var lb=document.getElementById('lbar'); var lt=document.getElementById('ltxt'); if(lb) lb.style.display='flex'; if(lt) lt.textContent=interim; } if(final_.trim() && final_.trim()!==_brLastSent){ _brLastSent=final_.trim(); var now3=new Date(); var ts3=now3.toTimeString().slice(0,8); var lb2=document.getElementById('lbar'); if(lb2) lb2.style.display='none'; var lt2=document.getElementById('ltxt'); if(lt2) lt2.textContent=''; console.log('[BrowserMic] final: '+final_.trim()); window.dispatchEvent(new CustomEvent('geaux:transcript',{detail:{ts:ts3,text:final_.trim()}})); fetch('/prompt'+authQ,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text='+encodeURIComponent(final_.trim())}).catch(function(){}); } };
+    r.onresult = function(ev){
+      if(_browserMicMuted || _glassesConnected) return;
+      var interim=''; var final_='';
+      for(var i=ev.resultIndex;i<ev.results.length;i++){ if(ev.results[i].isFinal){ final_+=ev.results[i][0].transcript; } else { interim+=ev.results[i][0].transcript; } }
+      if(interim){ var lb=document.getElementById('lbar'); var lt=document.getElementById('ltxt'); if(lb) lb.style.display='flex'; if(lt) lt.textContent=interim; }
+      if(final_.trim()){ var now3=new Date(); var ts3=now3.toTimeString().slice(0,8); var lb2=document.getElementById('lbar'); if(lb2) lb2.style.display='none'; var lt2=document.getElementById('ltxt'); if(lt2) lt2.textContent=''; console.log('[BrowserMic] final: '+final_.trim()); window.dispatchEvent(new CustomEvent('geaux:transcript',{detail:{ts:ts3,text:final_.trim()}})); fetch('/prompt'+authQ,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text='+encodeURIComponent(final_.trim())}).catch(function(){}); }
+    };
     _brRecog = r;
     try{ r.start(); } catch(e){ console.warn('[BrowserMic] start failed:',e); }
   }
