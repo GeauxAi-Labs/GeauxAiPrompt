@@ -353,7 +353,7 @@ body{
 /* Listening bar */
 .lbar{
   display:none;padding:8px 14px;
-  background:linear-gradient(90deg,transparent,#1c1034 15%,#1c1034 85%,transparent);
+  background:linear-gradient(90deg,transparent,var(--bg2) 15%,var(--bg2) 85%,transparent);
   border-bottom:1px solid #7c3aed28;
   font-family:var(--mono);font-size:11px;color:var(--v3);
   align-items:flex-start;gap:8px;
