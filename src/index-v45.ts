@@ -574,8 +574,6 @@ kbd{
         window._pendingReloadWhileOverlay=true;
       } else if(inp && inp.value.trim().length>0){
         inp.dataset.pendingReload='1';
-      } else if(window._brMicRunning){
-        window._pendingReloadWhileOverlay=true;
       } else {
         window.location.reload();
       }
@@ -1007,7 +1005,7 @@ kbd{
         avatarEl.checked=!!d.avatarEnabled;
         if(avatarHint) avatarHint.textContent=d.avatarEnabled?'ON — avatar appears during speech':'OFF — avatar hidden';
       }
-      var bmEl=document.getElementById('p-browser-mic'); var bmHint=document.getElementById('p-browser-mic-hint'); if(bmEl&&d.browserMicEnabled!==undefined){bmEl.checked=!!d.browserMicEnabled; if(bmHint) bmHint.textContent=d.browserMicEnabled?'ON — browser mic active when offline':'OFF — browser mic disabled'; if(d.browserMicEnabled && !_glassesConnected){ setTimeout(_startBrowserMic, 800); }}
+      var bmEl=document.getElementById('p-browser-mic'); var bmHint=document.getElementById('p-browser-mic-hint'); if(bmEl&&d.browserMicEnabled!==undefined){bmEl.checked=!!d.browserMicEnabled; if(bmHint) bmHint.textContent=d.browserMicEnabled?'ON — browser mic active when offline':'OFF — browser mic disabled';}
     }).catch(function(){});
 
   var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
@@ -1430,7 +1428,7 @@ kbd{
   var _brLastSent       = '';
 
   function _startBrowserMic(){
-    _brEnabled = true; window._brMicRunning = true;
+    _brEnabled = true;
     if(_browserMicActive) return;
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SR){ console.warn('[BrowserMic] SpeechRecognition not supported'); return; }
@@ -1448,7 +1446,7 @@ kbd{
   }
 
   function _stopBrowserMic(){
-    _brEnabled=false; window._brMicRunning=false;
+    _brEnabled=false;
     _brRestarting=false;
     _browserMicActive=false;
     if(_brRecog){ try{ _brRecog.abort(); }catch(e){} _brRecog=null; }
