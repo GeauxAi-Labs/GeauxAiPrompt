@@ -41,7 +41,6 @@ interface GenParams {
   webSearch:    boolean;
   useCloudflare: boolean;
   elevenLabsVoiceId: string;
-  elevenPathPref:    'mentraos' | 'geauxai';
   kokoroVoice: string;
   avatarEnabled: boolean;
 }
@@ -62,7 +61,7 @@ interface UserState {
   deviceState:    { batteryLevel: number | null; charging: boolean; wifiConnected: boolean; } | null;
   isListening:    boolean;
   ttsEnabled:     boolean;
-  ttsEngine:      'elevenlabs' | 'elevenlabs_direct' | 'kokoro';
+  ttsEngine:      'elevenlabs' | 'kokoro';
   lastPrompt:     string;   // last user question shown on glasses (Q&A header)
 }
 const userStates          = new Map<string, UserState>();
@@ -86,13 +85,11 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   webSearch:    true,
   useCloudflare: false,
   elevenLabsVoiceId: '',
-  elevenPathPref:    'mentraos' as 'mentraos' | 'geauxai',
   kokoroVoice: '',
   avatarEnabled: true,
 };
 
 DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
-DEFAULT_GEN_PARAMS.elevenPathPref = 'mentraos';
 DEFAULT_GEN_PARAMS.kokoroVoice = KOKORO_VOICE;
 
 const CF_MODELS: string[] = [
@@ -190,11 +187,11 @@ function buildPage(
   history: { role: string; content: string }[],
   micMuted: boolean,
   ttsEnabled: boolean,
-  ttsEngine: 'elevenlabs' | 'elevenlabs_direct' | 'kokoro',
+  ttsEngine: 'elevenlabs' | 'kokoro',
   promptCount: number = 0
 ): string {
   const ttsChipLabel = ttsEnabled ? '🔊 VOICE ON' : '🔇 VOICE OFF';
-  const engineChipLabel = ttsEngine === 'kokoro' ? '⚡ KOKORO' : ttsEngine === 'elevenlabs_direct' ? '☁ ELEVEN (Direct)' : '☁ ELEVEN';
+  const engineChipLabel = ttsEngine === 'kokoro' ? '⚡ KOKORO' : '☁ ELEVEN';
   const statusChipClass = processing ? 'chip-thinking' : connected ? 'chip-live' : 'chip-offline';
   const statusChipLabel = processing ? '● THINKING' : connected ? '● LIVE' : '● OFFLINE';
   const statusText = processing
@@ -561,7 +558,7 @@ kbd{
     }
     if(d.ttsEngine!==undefined){
       var ec=document.getElementById('chip-engine');
-      if(ec) ec.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':d.ttsEngine==='elevenlabs_direct'?'☁ ELEVEN (Direct)':'☁ ELEVEN';
+      if(ec) ec.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
     }
     if(d.reload){
       var inp=document.getElementById('ft-inp');
@@ -720,10 +717,6 @@ kbd{
       <select class="p-sel" id="p-model"><option value="">Default (${AI_MODEL})</option></select>
     </div>
     ${ELEVENLABS_API_KEY ? `
-<div class="p-row" id="p-row-eleven-path">
-  <span class="p-lbl">ELEVENLABS PATH <span class="p-hint">— MentraOS: plays via glasses/phone. GeauxAI: plays directly in browser via API key</span></span>
-  <select class="p-sel" id="p-eleven-path"><option value="mentraos">MentraOS (via SDK)</option><option value="geauxai">GeauxAI (direct API)</option></select>
-</div>
 <div class="p-row" id="p-row-eleven-voice">
   <span class="p-lbl">ELEVENLABS VOICE <span class="p-hint">— voice used when ELEVEN engine is selected</span></span>
   <select class="p-sel" id="p-eleven-voice"><option value="">Default (from .env)</option></select>
@@ -863,7 +856,6 @@ kbd{
         topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
         model:mdl?mdl.value:'',webSearch:ws?ws.checked:true,
         useCloudflare:cf?cf.checked:false,
-        elevenPathPref:document.getElementById('p-eleven-path')?document.getElementById('p-eleven-path').value:'mentraos',
         elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
         kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
         ,avatarEnabled:avatarEl?!!avatarEl.checked:true
@@ -959,7 +951,6 @@ kbd{
         refreshModels(d.useCloudflare?'cloudflare':'ollama');
       }
       refreshElevenVoices(d.elevenLabsVoiceId || '');
-      var _ep=document.getElementById('p-eleven-path'); if(_ep && d.elevenPathPref) _ep.value=d.elevenPathPref;
       refreshKokoroVoices(d.kokoroVoice || '');
       var avatarEl=document.getElementById('p-avatar');
       var avatarHint=document.getElementById('p-avatar-hint');
@@ -1004,7 +995,6 @@ kbd{
   if(mtEl){mtEl.addEventListener('change',sendParams);mtEl.addEventListener('blur',sendParams);}
   var sysEl=document.getElementById('p-sys');
   if(sysEl){sysEl.addEventListener('blur',sendParams);sysEl.addEventListener('input',dSend);}
-  var elevenPathEl=document.getElementById('p-eleven-path'); if(elevenPathEl) elevenPathEl.addEventListener('change',sendParams);
   var elevVoiceEl = document.getElementById('p-eleven-voice');
   if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
   var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
@@ -1022,7 +1012,7 @@ kbd{
       .then(function(r){return r.json();})
       .then(function(d){
         var chip=document.getElementById('chip-engine');
-        if(chip) chip.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':d.ttsEngine==='elevenlabs_direct'?'☁ ELEVEN (Direct)':'☁ ELEVEN';
+        if(chip) chip.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
       }).catch(function(){});
   };
 
@@ -1980,13 +1970,7 @@ class GeauxAIApp extends AppServer {
       const userId = resolveUser(req);
       if (!userId) return res.json({ ok: false, error: 'Unauthorized' });
       const s = getState(userId);
-      if (s.ttsEngine === 'kokoro') {
-        s.ttsEngine = ELEVENLABS_API_KEY ? 'elevenlabs' : 'kokoro';
-      } else if (s.ttsEngine === 'elevenlabs') {
-        s.ttsEngine = ELEVENLABS_API_KEY ? 'elevenlabs_direct' : 'kokoro';
-      } else {
-        s.ttsEngine = 'kokoro';
-      }
+      s.ttsEngine = s.ttsEngine === 'kokoro' ? 'elevenlabs' : 'kokoro';
       console.log(`[TTSEngine] ${userId} ttsEngine=${s.ttsEngine}`);
       broadcastToUser(userId, 'state', {
         processing: s.isProcessing, searching: false,
@@ -2203,12 +2187,6 @@ class GeauxAIApp extends AppServer {
         s.genParams.useCloudflare = b.useCloudflare;
       if (typeof b.elevenLabsVoiceId === 'string')
         s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
-      if (b.elevenPathPref === 'mentraos' || b.elevenPathPref === 'geauxai')
-        s.genParams.elevenPathPref = b.elevenPathPref;
-      // Sync ttsEngine with elevenPathPref when ELEVEN is active
-      if (s.ttsEngine === 'elevenlabs' || s.ttsEngine === 'elevenlabs_direct') {
-        s.ttsEngine = s.genParams.elevenPathPref === 'geauxai' ? 'elevenlabs_direct' : 'elevenlabs';
-      }
       if (typeof b.kokoroVoice === 'string')
         s.genParams.kokoroVoice = b.kokoroVoice;
       if (typeof b.avatarEnabled === 'boolean')
@@ -2398,7 +2376,7 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
     const prefs = JSON.parse(raw);
     const s = getState(userId);
     if (typeof prefs.ttsEnabled === 'boolean')                         s.ttsEnabled = prefs.ttsEnabled;
-    if (prefs.ttsEngine === 'kokoro' || prefs.ttsEngine === 'elevenlabs' || prefs.ttsEngine === 'elevenlabs_direct') s.ttsEngine = prefs.ttsEngine;
+    if (prefs.ttsEngine === 'kokoro' || prefs.ttsEngine === 'elevenlabs') s.ttsEngine = prefs.ttsEngine;
     if (typeof prefs.micMuted   === 'boolean')                         s.micMuted   = prefs.micMuted;
     if (prefs.genParams) {
       if (prefs.genParams.systemPrompt)                    s.genParams.systemPrompt = prefs.genParams.systemPrompt;
@@ -2509,8 +2487,6 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession 
         setTimeout(() => {
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
-      } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -2697,8 +2673,6 @@ async function handleImagePrompt(
         setTimeout(() => {
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
-      } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -3075,58 +3049,6 @@ async function speakWithElevenLabs(session: AppSession | undefined, text: string
   } catch (err: any) {
     console.log(`[TTS] ElevenLabs error: ${err.message}`);
     broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs' });
-  }
-}
-
-async function speakWithElevenLabsDirect(userId: string, text: string, voiceId?: string): Promise<void> {
-  if (!ELEVENLABS_API_KEY) return;
-  try {
-    const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
-    const vid = (voiceId || ELEVENLABS_VOICE_ID) || 'EXAVITQu4vr4xnSDxMaL';
-    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}/stream`, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': ELEVENLABS_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg',
-      },
-      body: JSON.stringify({
-        text: safeText,
-        model_id: 'eleven_turbo_v2_5',
-        voice_settings: {
-          stability:        0.5,
-          similarity_boost: 0.75,
-          speed:            1.1,
-        },
-      }),
-    });
-    if (!r.ok) {
-      const errText = await r.text().catch(() => '');
-      console.log(`[TTS] ElevenLabs Direct error ${r.status}: ${errText.slice(0, 120)}`);
-      broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs_direct' });
-      return;
-    }
-    const audioBuffer = Buffer.from(await r.arrayBuffer());
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    audioCache.set(id, { buf: audioBuffer, expires: Date.now() + 300_000 });
-    const audioUrl = `/tts-audio/${id}`;
-    broadcastToUser(userId, 'tts_audio', { url: audioUrl });
-    console.log(`[TTS] ElevenLabs Direct → SSE audio push (${safeText.length} chars, voice: ${vid})`);
-    cancelAutoClearTimer(userId);
-    const ds = getState(userId);
-    ds.autoClearTimer = setTimeout(async () => {
-      ds.autoClearTimer = null;
-      const dSession = activeSessions.get(userId);
-      if (dSession) {
-        try { await dSession.layouts.clearView(); } catch {}
-        updateDashboard(dSession, 'Ready');
-        console.log(`[AutoClear] Display cleared for ${userId}`);
-      }
-    }, AUTO_CLEAR_DELAY_MS);
-    console.log(`[AutoClear] Timer started for ${userId} (${AUTO_CLEAR_DELAY_MS}ms) [post-ElevenDirect]`);
-  } catch (err: any) {
-    console.log(`[TTS] ElevenLabs Direct failed: ${err.message}`);
-    broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs_direct' });
   }
 }
 
