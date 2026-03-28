@@ -41,6 +41,7 @@ interface GenParams {
   webSearch:    boolean;
   useCloudflare: boolean;
   elevenLabsVoiceId: string;
+  elevenDirectVoiceId:  string;
   elevenPathPref:    'mentraos' | 'geauxai';
   kokoroVoice: string;
   avatarEnabled: boolean;
@@ -86,12 +87,14 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   webSearch:    true,
   useCloudflare: false,
   elevenLabsVoiceId: '',
+  elevenDirectVoiceId: '',
   elevenPathPref:    'mentraos' as 'mentraos' | 'geauxai',
   kokoroVoice: '',
   avatarEnabled: true,
 };
 
 DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
+DEFAULT_GEN_PARAMS.elevenDirectVoiceId = '';
 DEFAULT_GEN_PARAMS.elevenPathPref = 'mentraos';
 DEFAULT_GEN_PARAMS.kokoroVoice = KOKORO_VOICE;
 
@@ -725,8 +728,12 @@ kbd{
   <select class="p-sel" id="p-eleven-path"><option value="mentraos">MentraOS (via SDK)</option><option value="geauxai">GeauxAI (direct API)</option></select>
 </div>
 <div class="p-row" id="p-row-eleven-voice">
-  <span class="p-lbl">ELEVENLABS VOICE <span class="p-hint">— voice used when ELEVEN engine is selected</span></span>
+  <span class="p-lbl">ELEVEN VOICE — MentraOS <span class="p-hint">— paid library voices, used when ELEVEN (MentraOS) engine is active</span></span>
   <select class="p-sel" id="p-eleven-voice"><option value="">Default (from .env)</option></select>
+</div>
+<div class="p-row" id="p-row-eleven-direct-voice">
+  <span class="p-lbl">ELEVEN VOICE — Direct <span class="p-hint">— free tier premade voices, used when ELEVEN (Direct) engine is active</span></span>
+  <select class="p-sel" id="p-eleven-direct-voice"><option value="">Default (Rachel)</option></select>
 </div>` : ''}
     ${KOKORO_HOST ? `
 <div class="p-row" id="p-row-kokoro-voice">
@@ -865,6 +872,7 @@ kbd{
         useCloudflare:cf?cf.checked:false,
         elevenPathPref:document.getElementById('p-eleven-path')?document.getElementById('p-eleven-path').value:'mentraos',
         elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
+        elevenDirectVoiceId:document.getElementById('p-eleven-direct-voice')?document.getElementById('p-eleven-direct-voice').value:'',
         kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
         ,avatarEnabled:avatarEl?!!avatarEl.checked:true
       })
@@ -906,6 +914,23 @@ kbd{
         });
       }).catch(function(){});
   }
+  function refreshElevenDirectVoices(selectedId) {
+    fetch('/api/elevenlabs-voices-free' + authQ)
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d || !d.voices) return;
+        var sel = document.getElementById('p-eleven-direct-voice');
+        if (!sel) return;
+        while (sel.options.length > 1) sel.remove(1);
+        d.voices.forEach(function(v){
+          var opt = document.createElement('option');
+          opt.value = v.voice_id;
+          opt.textContent = v.name;
+          if (selectedId && v.voice_id === selectedId) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      }).catch(function(){});
+  }
   function refreshKokoroVoices(selectedId) {
     fetch('/api/kokoro-voices' + authQ)
       .then(function(r){ return r.ok ? r.json() : null; })
@@ -926,6 +951,7 @@ kbd{
   // Initial load
   refreshModels('ollama');
   refreshElevenVoices();
+  refreshElevenDirectVoices();
   refreshKokoroVoices();
 
   fetch('/api/params'+authQ)
@@ -959,6 +985,7 @@ kbd{
         refreshModels(d.useCloudflare?'cloudflare':'ollama');
       }
       refreshElevenVoices(d.elevenLabsVoiceId || '');
+      refreshElevenDirectVoices(d.elevenDirectVoiceId || '');
       var _ep=document.getElementById('p-eleven-path'); if(_ep && d.elevenPathPref) _ep.value=d.elevenPathPref;
       refreshKokoroVoices(d.kokoroVoice || '');
       var avatarEl=document.getElementById('p-avatar');
@@ -1007,6 +1034,7 @@ kbd{
   var elevenPathEl=document.getElementById('p-eleven-path'); if(elevenPathEl) elevenPathEl.addEventListener('change',sendParams);
   var elevVoiceEl = document.getElementById('p-eleven-voice');
   if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
+  var elevDirectVoiceEl=document.getElementById('p-eleven-direct-voice'); if(elevDirectVoiceEl) elevDirectVoiceEl.addEventListener('change',sendParams);
   var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
   if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
   var avTogEl=document.getElementById('p-avatar');
@@ -2203,6 +2231,8 @@ class GeauxAIApp extends AppServer {
         s.genParams.useCloudflare = b.useCloudflare;
       if (typeof b.elevenLabsVoiceId === 'string')
         s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
+      if (typeof b.elevenDirectVoiceId === 'string')
+        s.genParams.elevenDirectVoiceId = b.elevenDirectVoiceId;
       if (b.elevenPathPref === 'mentraos' || b.elevenPathPref === 'geauxai')
         s.genParams.elevenPathPref = b.elevenPathPref;
       // Sync ttsEngine with elevenPathPref when ELEVEN is active
@@ -2256,6 +2286,27 @@ class GeauxAIApp extends AppServer {
         // Return empty list if Kokoro is not running or unreachable
         res.json({ voices: [] });
       }
+    });
+
+    // GET /api/elevenlabs-voices-free — ElevenLabs premade/default voices, available on free tier via direct API
+    app.get('/api/elevenlabs-voices-free', (_req: any, res: any) => {
+      res.json({ voices: [
+        { voice_id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (Female, American)' },
+        { voice_id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam (Male, American, Deep)' },
+        { voice_id: 'Xb7hH8MSUJpSbSDYk0k2', name: 'Alice (Female, British)' },
+        { voice_id: 'pqHfZKP75CvOlQylNhV4', name: 'Bill (Male, American)' },
+        { voice_id: 'IKne3meq5aSn9XLyUdCD', name: 'Charlie (Male, Australian)' },
+        { voice_id: 'XB0fDUnXU5powFXDhCwa', name: 'Charlotte (Female, Swedish)' },
+        { voice_id: 'iP95p4xoKVk53GoZ742B', name: 'Chris (Male, American)' },
+        { voice_id: 'onwK4e9ZLuTAKqWW03F9', name: 'Daniel (Male, British, Authoritative)' },
+        { voice_id: 'cjVigY5qzO86Huf0OWal', name: 'Eric (Male, American)' },
+        { voice_id: 'jsCqWAovK2LkecY7zXl4', name: 'Freya (Female, American)' },
+        { voice_id: 'JBFqnCBsd6RMkjVDRZzb', name: 'George (Male, British)' },
+        { voice_id: 'TX3LPaxmHKxFdv7VOQHJ', name: 'Liam (Male, American)' },
+        { voice_id: 'XrExE9yKIg1WjnnlVkGX', name: 'Matilda (Female, American, Warm)' },
+        { voice_id: 'SAz9YHcvj6GT2YYXdXww', name: 'River (Neutral, American)' },
+        { voice_id: 'bIHbv24MWmeRgasZH58o', name: 'Will (Male, American, Friendly)' },
+      ]});
     });
 
     // GET /api/elevenlabs-voices — returns static hardcoded voice list
@@ -2408,6 +2459,7 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
       if (prefs.genParams.model)                           s.genParams.model        = prefs.genParams.model;
       if (typeof prefs.genParams.useCloudflare === 'boolean') s.genParams.useCloudflare = prefs.genParams.useCloudflare;
       if (typeof prefs.genParams.elevenLabsVoiceId === 'string') s.genParams.elevenLabsVoiceId = prefs.genParams.elevenLabsVoiceId;
+      if (typeof prefs.genParams.elevenDirectVoiceId === 'string') s.genParams.elevenDirectVoiceId = prefs.genParams.elevenDirectVoiceId;
       if (typeof prefs.genParams.kokoroVoice === 'string') s.genParams.kokoroVoice = prefs.genParams.kokoroVoice;
       if (typeof prefs.genParams.avatarEnabled === 'boolean') s.genParams.avatarEnabled = prefs.genParams.avatarEnabled;
     }
@@ -2510,7 +2562,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession 
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
       } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
+        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenDirectVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -2698,7 +2750,7 @@ async function handleImagePrompt(
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
       } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
+        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenDirectVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -3082,7 +3134,7 @@ async function speakWithElevenLabsDirect(userId: string, text: string, voiceId?:
   if (!ELEVENLABS_API_KEY) return;
   try {
     const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
-    const vid = (voiceId || ELEVENLABS_VOICE_ID) || 'EXAVITQu4vr4xnSDxMaL';
+    const vid = voiceId || '21m00Tcm4TlvDq8ikWAM';
     const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}/stream`, {
       method: 'POST',
       headers: {
@@ -3092,7 +3144,7 @@ async function speakWithElevenLabsDirect(userId: string, text: string, voiceId?:
       },
       body: JSON.stringify({
         text: safeText,
-        model_id: 'eleven_turbo_v2_5',
+        model_id: 'eleven_flash_v2',
         voice_settings: {
           stability:        0.5,
           similarity_boost: 0.75,

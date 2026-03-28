@@ -1,4 +1,4 @@
-import { AppServer, AppSession } from '@mentra/sdk';
+﻿import { AppServer, AppSession } from '@mentra/sdk';
 import multer from 'multer';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
@@ -41,6 +41,7 @@ interface GenParams {
   webSearch:    boolean;
   useCloudflare: boolean;
   elevenLabsVoiceId: string;
+  elevenPathPref:    'mentraos' | 'geauxai';
   kokoroVoice: string;
   avatarEnabled: boolean;
 }
@@ -61,7 +62,7 @@ interface UserState {
   deviceState:    { batteryLevel: number | null; charging: boolean; wifiConnected: boolean; } | null;
   isListening:    boolean;
   ttsEnabled:     boolean;
-  ttsEngine:      'elevenlabs' | 'kokoro';
+  ttsEngine:      'elevenlabs' | 'elevenlabs_direct' | 'kokoro';
   lastPrompt:     string;   // last user question shown on glasses (Q&A header)
 }
 const userStates          = new Map<string, UserState>();
@@ -85,11 +86,13 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   webSearch:    true,
   useCloudflare: false,
   elevenLabsVoiceId: '',
+  elevenPathPref:    'mentraos' as 'mentraos' | 'geauxai',
   kokoroVoice: '',
   avatarEnabled: true,
 };
 
 DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
+DEFAULT_GEN_PARAMS.elevenPathPref = 'mentraos';
 DEFAULT_GEN_PARAMS.kokoroVoice = KOKORO_VOICE;
 
 const CF_MODELS: string[] = [
@@ -187,11 +190,11 @@ function buildPage(
   history: { role: string; content: string }[],
   micMuted: boolean,
   ttsEnabled: boolean,
-  ttsEngine: 'elevenlabs' | 'kokoro',
+  ttsEngine: 'elevenlabs' | 'elevenlabs_direct' | 'kokoro',
   promptCount: number = 0
 ): string {
   const ttsChipLabel = ttsEnabled ? '🔊 VOICE ON' : '🔇 VOICE OFF';
-  const engineChipLabel = ttsEngine === 'kokoro' ? '⚡ KOKORO' : '☁ ELEVEN';
+  const engineChipLabel = ttsEngine === 'kokoro' ? '⚡ KOKORO' : ttsEngine === 'elevenlabs_direct' ? '☁ ELEVEN (Direct)' : '☁ ELEVEN';
   const statusChipClass = processing ? 'chip-thinking' : connected ? 'chip-live' : 'chip-offline';
   const statusChipLabel = processing ? '● THINKING' : connected ? '● LIVE' : '● OFFLINE';
   const statusText = processing
@@ -558,7 +561,7 @@ kbd{
     }
     if(d.ttsEngine!==undefined){
       var ec=document.getElementById('chip-engine');
-      if(ec) ec.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
+      if(ec) ec.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':d.ttsEngine==='elevenlabs_direct'?'☁ ELEVEN (Direct)':'☁ ELEVEN';
     }
     if(d.reload){
       var inp=document.getElementById('ft-inp');
@@ -717,6 +720,10 @@ kbd{
       <select class="p-sel" id="p-model"><option value="">Default (${AI_MODEL})</option></select>
     </div>
     ${ELEVENLABS_API_KEY ? `
+<div class="p-row" id="p-row-eleven-path">
+  <span class="p-lbl">ELEVENLABS PATH <span class="p-hint">— MentraOS: plays via glasses/phone. GeauxAI: plays directly in browser via API key</span></span>
+  <select class="p-sel" id="p-eleven-path"><option value="mentraos">MentraOS (via SDK)</option><option value="geauxai">GeauxAI (direct API)</option></select>
+</div>
 <div class="p-row" id="p-row-eleven-voice">
   <span class="p-lbl">ELEVENLABS VOICE <span class="p-hint">— voice used when ELEVEN engine is selected</span></span>
   <select class="p-sel" id="p-eleven-voice"><option value="">Default (from .env)</option></select>
@@ -795,9 +802,21 @@ kbd{
   <div id="tlog-list" style="flex:1;overflow-y:auto;padding:12px 16px;">
     <div id="tlog-empty" style="text-align:center;color:var(--tx3);font-size:10px;padding:40px 0;letter-spacing:.06em;">No transcriptions yet this session</div>
   </div>
-  <div style="display:flex;gap:8px;padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom,16px));border-top:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
-    <button onclick="clearTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--r);">\uD83D\uDDD1 CLEAR</button>
-    <button onclick="saveTranscriptLog()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--g2);">\uD83D\uDCBE SAVE .TXT</button>
+  <div id="ask-ai-pane" style="display:none;flex-direction:column;gap:10px;padding:14px 16px;flex:1;overflow-y:auto;">
+    <div style="font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.12em;color:var(--v3);">🤖 ASK AI ABOUT THIS TRANSCRIPT</div>
+    <div style="font-family:var(--mono);font-size:9px;color:var(--tx3);line-height:1.5;" id="ask-ai-ctx-info"></div>
+    <div id="ask-ai-presets" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    <textarea id="ask-ai-input" placeholder="Ask anything about the transcript…" rows="3" style="width:100%;background:var(--bg3);color:var(--tx);border:1px solid var(--edge);border-radius:var(--rad);font-family:var(--mono);font-size:11px;line-height:1.55;padding:8px 10px;outline:none;resize:vertical;min-height:60px;"></textarea>
+    <div style="display:flex;gap:8px;">
+      <button type="button" onclick="closeAskAIPane()" style="flex:1;padding:10px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--tx3);">← BACK</button>
+      <button id="ask-ai-submit" type="button" style="flex:2;padding:10px;background:var(--glass);border:1px solid var(--v2);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.10em;color:var(--v3);" onclick="submitAskAI()">🤖 SEND TO AI</button>
+    </div>
+  </div>
+  <div id="tlog-footer" style="display:flex;gap:6px;padding:12px 16px;padding-bottom:max(12px,env(safe-area-inset-bottom,16px));border-top:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
+    <button onclick="clearTranscriptLog()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--r);">\uD83D\uDDD1 CLEAR</button>
+    <button onclick="saveTranscriptLog()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--g2);">\uD83D\uDCBE SAVE .TXT</button>
+    <button onclick="resetSpeakers()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--edge);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--a);">🔄 RESET SPKRS</button>
+    <button onclick="openAskAIPane()" style="flex:1;min-width:0;padding:9px 4px;background:var(--glass);border:1px solid var(--v2);border-radius:var(--rad);cursor:pointer;font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:.10em;color:var(--v3);">🤖 ASK AI</button>
   </div>
 </div>
 </div>
@@ -810,6 +829,10 @@ kbd{
   var pOpen=false;
   var transcriptLog=(function(){try{var s=localStorage.getItem('geaux_tlog');return s?JSON.parse(s):[];}catch(e){return [];}})();
   var overlayOpen=false;
+  var _nextSpeaker         = 1;
+  var _lastSpeaker         = 1;
+  var _speakerGapMs        = 3500;
+  var _speakerGapCalibrated = false;
 
   window.toggleP=function(){
     pOpen=!pOpen;
@@ -840,6 +863,7 @@ kbd{
         topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
         model:mdl?mdl.value:'',webSearch:ws?ws.checked:true,
         useCloudflare:cf?cf.checked:false,
+        elevenPathPref:document.getElementById('p-eleven-path')?document.getElementById('p-eleven-path').value:'mentraos',
         elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
         kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
         ,avatarEnabled:avatarEl?!!avatarEl.checked:true
@@ -935,6 +959,7 @@ kbd{
         refreshModels(d.useCloudflare?'cloudflare':'ollama');
       }
       refreshElevenVoices(d.elevenLabsVoiceId || '');
+      var _ep=document.getElementById('p-eleven-path'); if(_ep && d.elevenPathPref) _ep.value=d.elevenPathPref;
       refreshKokoroVoices(d.kokoroVoice || '');
       var avatarEl=document.getElementById('p-avatar');
       var avatarHint=document.getElementById('p-avatar-hint');
@@ -979,6 +1004,7 @@ kbd{
   if(mtEl){mtEl.addEventListener('change',sendParams);mtEl.addEventListener('blur',sendParams);}
   var sysEl=document.getElementById('p-sys');
   if(sysEl){sysEl.addEventListener('blur',sendParams);sysEl.addEventListener('input',dSend);}
+  var elevenPathEl=document.getElementById('p-eleven-path'); if(elevenPathEl) elevenPathEl.addEventListener('change',sendParams);
   var elevVoiceEl = document.getElementById('p-eleven-voice');
   if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
   var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
@@ -996,7 +1022,7 @@ kbd{
       .then(function(r){return r.json();})
       .then(function(d){
         var chip=document.getElementById('chip-engine');
-        if(chip) chip.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':'☁ ELEVEN';
+        if(chip) chip.textContent=d.ttsEngine==='kokoro'?'⚡ KOKORO':d.ttsEngine==='elevenlabs_direct'?'☁ ELEVEN (Direct)':'☁ ELEVEN';
       }).catch(function(){});
   };
 
@@ -1027,19 +1053,43 @@ kbd{
     var empty=document.getElementById('tlog-empty');
     if(!list) return;
     list.querySelectorAll('.tlog-row').forEach(function(r){r.remove();});
+    var existSum=document.getElementById('tlog-summary');
+    if(existSum) existSum.remove();
     if(transcriptLog.length===0){if(empty) empty.style.display='block';return;}
     if(empty) empty.style.display='none';
+    // Speaker color palette — hardcoded hex (CSS vars cannot be concatenated with alpha suffixes)
+    var spkrHex=['#c4b5fd','#67e8f9','#34d399','#f59e0b','#f472b6','#94a3b8'];
+    function spkrColor(n){return (n>=1&&n<=5)?spkrHex[n-1]:spkrHex[5];}
+    // Summary bar
+    var spkrSet=new Set();
+    transcriptLog.forEach(function(e){if(e.speaker!==undefined) spkrSet.add(e.speaker);});
+    var maxGap=0;
+    for(var si=0;si<transcriptLog.length-1;si++){
+      var sg=Math.abs((transcriptLog[si].tsMs||0)-(transcriptLog[si+1].tsMs||0));
+      if(sg>maxGap) maxGap=sg;
+    }
+    var sumDiv=document.createElement('div');
+    sumDiv.id='tlog-summary';
+    sumDiv.style.cssText='font-family:var(--mono);font-size:8.5px;color:var(--tx3);padding:6px 0 10px;letter-spacing:.06em;border-bottom:1px solid var(--edge);margin-bottom:8px;';
+    sumDiv.textContent=spkrSet.size+(spkrSet.size!==1?' speakers':' speaker')+' detected · longest gap: '+maxGap+'ms · '+transcriptLog.length+(transcriptLog.length!==1?' utterances':' utterance');
+    list.insertBefore(sumDiv,list.firstChild);
+    // Rows
     transcriptLog.forEach(function(entry){
+      var spk=entry.speaker!==undefined?entry.speaker:1;
+      var color=spkrColor(spk);
       var row=document.createElement('div');
       row.className='tlog-row';
       row.style.cssText='padding:7px 0;border-bottom:1px solid var(--edge);font-size:10px;line-height:1.5;color:var(--tx);display:flex;gap:10px;align-items:flex-start;';
       var ts=document.createElement('span');
       ts.style.cssText='color:var(--v3);flex-shrink:0;font-size:9px;padding-top:1px;';
       ts.textContent='['+entry.ts+']';
+      var chip=document.createElement('span');
+      chip.style.cssText='font-size:8px;font-weight:700;letter-spacing:.10em;padding:1px 5px;border-radius:3px;border:1px solid '+color+'40;color:'+color+';background:'+color+'10;flex-shrink:0;margin-right:2px;';
+      chip.textContent='SPKR '+(entry.speaker!==undefined?entry.speaker:'?');
       var txt=document.createElement('span');
       txt.style.cssText='flex:1;word-break:break-word;';
       txt.textContent=entry.text;
-      row.appendChild(ts);row.appendChild(txt);
+      row.appendChild(ts);row.appendChild(chip);row.appendChild(txt);
       list.appendChild(row);
     });
   }
@@ -1067,7 +1117,7 @@ kbd{
     var now=new Date();
     var header='GeauxAI Transcription Log \u2014 '+now.toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'})+' '+now.toLocaleTimeString('en-US');
     var lines=[header,'\u2500'.repeat(50),''];
-    transcriptLog.slice().reverse().forEach(function(e){lines.push('['+e.ts+'] '+e.text);});
+    transcriptLog.slice().reverse().forEach(function(e){lines.push('['+e.ts+'] [SPKR '+(e.speaker!==undefined?e.speaker:'?')+'] '+e.text);});
     var content=lines.join(String.fromCharCode(10));
     var yyyy=now.getFullYear(),mm=String(now.getMonth()+1).padStart(2,'0'),dd=String(now.getDate()).padStart(2,'0');
     var filename='geauxai-transcript-'+yyyy+'-'+mm+'-'+dd+'.txt';
@@ -1091,15 +1141,142 @@ kbd{
   };
 
   window.addEventListener('geaux:transcript',function(e){
-    transcriptLog.unshift({ts:e.detail.ts,text:e.detail.text});
+    var tsMs = Date.now();
+    var ts = e.detail.ts;
+    var text = e.detail.text;
+    var speaker;
+    if(transcriptLog.length === 0){
+      speaker = 1;
+      _lastSpeaker = 1;
+      _nextSpeaker = 2;
+    } else {
+      var prev = transcriptLog[0];
+      var gapMs = tsMs - (prev.tsMs || 0);
+      if(gapMs > _speakerGapMs){
+        speaker = _nextSpeaker;
+        _lastSpeaker = _nextSpeaker;
+        _nextSpeaker++;
+      } else {
+        speaker = _lastSpeaker;
+      }
+    }
+    transcriptLog.unshift({ts:ts, text:text, speaker:speaker, tsMs:tsMs});
     tlogSave();
     tlogUpdateCount();
     if(overlayOpen) tlogRender();
+    // AI calibration: fire once after 5th entry
+    if(transcriptLog.length === 5 && !_speakerGapCalibrated){
+      _speakerGapCalibrated = true;
+      var reversed = transcriptLog.slice().reverse();
+      var calEntries = reversed.map(function(en, i){
+        var gap = i === 0 ? 0 : Math.abs((en.tsMs||0) - (reversed[i-1].tsMs||0));
+        return {ts: en.ts, text: en.text, gapMs: gap};
+      });
+      fetch('/api/calibrate-speaker-gap'+authQ,{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({entries:calEntries})
+      }).then(function(r){return r.ok?r.json():null;})
+        .then(function(d){
+          if(d && typeof d.gapMs === 'number'){
+            _speakerGapMs = d.gapMs;
+            console.log('[SpeakerCalib] gap set to', d.gapMs, 'ms');
+          }
+        }).catch(function(){});
+    }
   });
 
   // Auto-resize textarea
   var inp=document.getElementById('ft-inp');
   if(inp) inp.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px';});
+
+  // ── Speaker diarization helpers ───────────────────────────────────────
+  window.resetSpeakers = function(){
+    _nextSpeaker = 1;
+    _lastSpeaker = 1;
+    _speakerGapCalibrated = false;
+    _speakerGapMs = 3500;
+    console.log('[Speaker] Reset to Speaker 1');
+  };
+
+  // ── Ask AI about transcript ───────────────────────────────────────────
+  window.openAskAIPane = function(){
+    var pane = document.getElementById('ask-ai-pane');
+    var tll  = document.getElementById('tlog-list');
+    var tfoot= document.getElementById('tlog-footer');
+    if(!pane) return;
+    // Populate context info
+    var spkSet=new Set();
+    transcriptLog.forEach(function(e){if(e.speaker!==undefined) spkSet.add(e.speaker);});
+    var oldest = transcriptLog.length ? transcriptLog[transcriptLog.length-1].ts : '—';
+    var newest = transcriptLog.length ? transcriptLog[0].ts : '—';
+    var info = document.getElementById('ask-ai-ctx-info');
+    if(info) info.textContent = transcriptLog.length+' entries · '+spkSet.size+' speaker(s) detected · '+oldest+' to '+newest;
+    // Preset chips
+    var presetsEl = document.getElementById('ask-ai-presets');
+    if(presetsEl){
+      presetsEl.innerHTML='';
+      var presets=['Summarize this conversation','What were the key decisions?','List action items','Who spoke the most?','What topics were discussed?','Draft follow-up email'];
+      presets.forEach(function(p){
+        var chip=document.createElement('button');
+        chip.type='button';
+        chip.style.cssText='font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.07em;padding:5px 10px;border-radius:99px;border:1px solid #a855f740;color:#c4b5fd;background:#7c3aed10;cursor:pointer;';
+        chip.textContent=p;
+        chip.onclick=function(){
+          var ta=document.getElementById('ask-ai-input');
+          if(ta) ta.value=p;
+        };
+        presetsEl.appendChild(chip);
+      });
+    }
+    // Default value
+    var ta=document.getElementById('ask-ai-input');
+    if(ta) ta.value='Summarize this conversation';
+    // Show pane, hide list and footer
+    pane.style.display='flex';
+    if(tll) tll.style.display='none';
+    if(tfoot) tfoot.style.display='none';
+    if(ta) ta.focus();
+  };
+
+  window.submitAskAI = function(){
+    var question = (document.getElementById('ask-ai-input')||{}).value;
+    if(!question || !question.trim()) return;
+    question = question.trim();
+    var btn = document.getElementById('ask-ai-submit');
+    if(btn){ btn.disabled=true; btn.textContent='⏳ Sending…'; }
+    // Build chronological transcript (log is newest-first, so reverse it)
+    var entries = transcriptLog.slice().reverse();
+    var lines = entries.map(function(e){
+      return '['+e.ts+'] [SPKR '+(e.speaker||'?')+'] '+e.text;
+    });
+    var startTs = entries.length ? entries[0].ts : '';
+    var endTs   = entries.length ? entries[entries.length-1].ts : '';
+    var spkCount=new Set(entries.map(function(e){return e.speaker;})).size;
+    var contextBlock='[TRANSCRIPT '+startTs+' to '+endTs+' | '+entries.length+' utterances | '+spkCount+' speaker(s)]'+String.fromCharCode(10)+lines.join(String.fromCharCode(10))+String.fromCharCode(10)+'[END TRANSCRIPT]';
+    var fullPrompt = contextBlock+String.fromCharCode(10)+String.fromCharCode(10)+question;
+    fetch('/prompt'+authQ,{
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'text='+encodeURIComponent(fullPrompt)
+    }).then(function(){
+      window.closeAskAIPane();
+      window.closeTranscriptLog();
+    }).catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='🤖 SEND TO AI';}
+    });
+  };
+
+  window.closeAskAIPane = function(){
+    var pane  = document.getElementById('ask-ai-pane');
+    var tll   = document.getElementById('tlog-list');
+    var tfoot = document.getElementById('tlog-footer');
+    var btn   = document.getElementById('ask-ai-submit');
+    if(pane)  pane.style.display  = 'none';
+    if(tll)   tll.style.display   = 'block';
+    if(tfoot) tfoot.style.display = 'flex';
+    if(btn){btn.disabled=false;btn.textContent='🤖 SEND TO AI';}
+  };
 
   // AJAX send (no page reload)
   var btn=document.getElementById('ft-go');
@@ -1682,7 +1859,28 @@ class GeauxAIApp extends AppServer {
     // Falls back to OWNER_EMAIL only when the webview is opened without a signed
     // token (e.g. direct browser hit during local dev) so the owner's dev workflow
     // is unchanged.
-    const resolveUser = (req: any): string => req.authUserId || OWNER_EMAIL;
+    // resolveUser returns the authenticated userId, or null if not authenticated.
+    // OWNER_EMAIL fallback is only used in local dev (NODE_ENV !== 'production').
+    // In production, unauthenticated requests get null and are rejected by their handlers.
+    // DEPLOYMENT NOTE: Set NODE_ENV=production in your Oracle .env to enable the strict
+    // auth check. On GMKtec local dev, either leave NODE_ENV unset or set it to
+    // 'development' and keep OWNER_EMAIL set — the fallback still works locally.
+    const resolveUser = (req: any): string | null => {
+      // Priority 1: MentraOS SDK-verified token (glasses app / signed webview URL)
+      if (req.authUserId) return req.authUserId;
+      // Priority 2: Cloudflare Access OTP-verified email header.
+      // Cloudflare injects this after a user passes email OTP — it cannot be
+      // spoofed by clients because Cloudflare strips any client-sent Cf-Access-*
+      // headers before forwarding to the origin. Every browser user who passes
+      // Cloudflare OTP gets their own completely isolated session, history, and state.
+      const cfEmail = req.headers?.['cf-access-authenticated-user-email'];
+      if (cfEmail && typeof cfEmail === 'string' && cfEmail.includes('@')) {
+        return cfEmail.toLowerCase().trim();
+      }
+      // Priority 3: Local dev fallback — disabled in production
+      if (process.env.NODE_ENV !== 'production' && OWNER_EMAIL) return OWNER_EMAIL;
+      return null;
+    };
 
     // Serve the live chat page.
     // The SDK auth middleware runs on every request and sets req.authUserId when token is valid.
@@ -1701,6 +1899,12 @@ class GeauxAIApp extends AppServer {
         return res.status(401).end(EXPIRED_PAGE_HTML);
       }
       const userId = resolveUser(req);
+      if (!userId) {
+        console.log('[Webview] No auth token — rejecting unauthenticated request');
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.status(401).end(EXPIRED_PAGE_HTML);
+      }
       const s = getState(userId);
       const html = buildPage(
         activeSessions.has(userId),
@@ -1721,6 +1925,7 @@ class GeauxAIApp extends AppServer {
     // then redirects back so the browser reloads a fresh empty page.
     app.post('/clear', async (req: any, res: any) => {
       const userId = resolveUser(req);
+      if (!userId) return res.redirect(303, '/webview');
       cancelAutoClearTimer(userId);
       const s = getState(userId);
       s.history = [];
@@ -1739,6 +1944,7 @@ class GeauxAIApp extends AppServer {
 
     app.post('/mic', async (req: any, res: any) => {
       const userId = resolveUser(req);
+      if (!userId) return res.redirect(303, '/webview');
       cancelAutoClearTimer(userId);
       const s = getState(userId);
       s.micMuted = !s.micMuted;
@@ -1756,6 +1962,7 @@ class GeauxAIApp extends AppServer {
 
     app.post('/tts', async (req: any, res: any) => {
       const userId = resolveUser(req);
+      if (!userId) return res.json({ ok: false, error: 'Unauthorized' });
       const s = getState(userId);
       s.ttsEnabled = !s.ttsEnabled;
       console.log(`[TTSToggle] ${userId} ttsEnabled=${s.ttsEnabled}`);
@@ -1771,8 +1978,15 @@ class GeauxAIApp extends AppServer {
 
     app.post('/tts-engine', async (req: any, res: any) => {
       const userId = resolveUser(req);
+      if (!userId) return res.json({ ok: false, error: 'Unauthorized' });
       const s = getState(userId);
-      s.ttsEngine = s.ttsEngine === 'kokoro' ? 'elevenlabs' : 'kokoro';
+      if (s.ttsEngine === 'kokoro') {
+        s.ttsEngine = ELEVENLABS_API_KEY ? 'elevenlabs' : 'kokoro';
+      } else if (s.ttsEngine === 'elevenlabs') {
+        s.ttsEngine = ELEVENLABS_API_KEY ? 'elevenlabs_direct' : 'kokoro';
+      } else {
+        s.ttsEngine = 'kokoro';
+      }
       console.log(`[TTSEngine] ${userId} ttsEngine=${s.ttsEngine}`);
       broadcastToUser(userId, 'state', {
         processing: s.isProcessing, searching: false,
@@ -1788,6 +2002,7 @@ class GeauxAIApp extends AppServer {
       const text = req.body?.text?.trim();
       if (!text || text.length < 1) return res.redirect(303, '/webview');
       const userId = resolveUser(req);
+      if (!userId) return res.redirect(303, '/webview');
       const session = activeSessions.get(userId);
       if (!session) {
         console.log(`[TypePrompt] No active glasses session for ${userId} — processing as web-only`);
@@ -1915,6 +2130,10 @@ class GeauxAIApp extends AppServer {
     // GET /api/stream — client subscribes here; server pushes 'state' events
     app.get('/api/stream', (req: any, res: any) => {
       const userId = resolveUser(req);
+      if (!userId) {
+        console.log('[SSE] No auth token — rejecting unauthenticated stream request');
+        return res.status(401).end('');
+      }
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -1984,6 +2203,12 @@ class GeauxAIApp extends AppServer {
         s.genParams.useCloudflare = b.useCloudflare;
       if (typeof b.elevenLabsVoiceId === 'string')
         s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
+      if (b.elevenPathPref === 'mentraos' || b.elevenPathPref === 'geauxai')
+        s.genParams.elevenPathPref = b.elevenPathPref;
+      // Sync ttsEngine with elevenPathPref when ELEVEN is active
+      if (s.ttsEngine === 'elevenlabs' || s.ttsEngine === 'elevenlabs_direct') {
+        s.ttsEngine = s.genParams.elevenPathPref === 'geauxai' ? 'elevenlabs_direct' : 'elevenlabs';
+      }
       if (typeof b.kokoroVoice === 'string')
         s.genParams.kokoroVoice = b.kokoroVoice;
       if (typeof b.avatarEnabled === 'boolean')
@@ -2075,11 +2300,38 @@ class GeauxAIApp extends AppServer {
       res.send(entry.buf);
     });
 
+    // ── Speaker gap calibration ───────────────────────────────────────────────
+    app.post('/api/calibrate-speaker-gap', async (req: any, res: any) => {
+      const userId = resolveUser(req);
+      if (!userId) return res.json({ gapMs: 3500 });
+      const s = getState(userId);
+      const entries: { ts: string; text: string; gapMs: number }[] = req.body?.entries || [];
+      if (!entries.length) return res.json({ gapMs: 3500 });
+      try {
+        const listing = entries.map((e, i) =>
+          `${i + 1}. [${e.ts}] (gap: ${e.gapMs}ms) ${e.text}`
+        ).join('\n');
+        const prompt = `You are analyzing a voice transcript from smart glasses to calibrate speaker diarization.\nHere are the first 5 utterances with the silence gap before each:\n${listing}\nBased on the rhythm of this conversation (interview, meeting, monologue, Q&A, etc.),\nwhat silence gap in milliseconds best indicates a speaker change?\nReply with ONLY a JSON object: { "gapMs": <number between 1500 and 8000> }\nNo explanation, no markdown, just the JSON.`;
+        const raw = await callAI([{ role: 'user', content: prompt }], s.genParams);
+        // Extract the JSON from the response
+        const match = raw.match(/\{[^}]+\}/);
+        if (!match) throw new Error('No JSON in response');
+        const parsed = JSON.parse(match[0]);
+        let gapMs = typeof parsed.gapMs === 'number' ? parsed.gapMs : 3500;
+        gapMs = Math.max(1500, Math.min(8000, Math.round(gapMs)));
+        console.log(`[SpeakerCalib] ${userId} calibrated gap to ${gapMs}ms`);
+        return res.json({ gapMs });
+      } catch (err: any) {
+        console.log(`[SpeakerCalib] ${userId} calibration error: ${err.message} — using default`);
+        return res.json({ gapMs: 3500 });
+      }
+    });
+
     app.get('/', serve);
     app.get('/webview', serve);
     app.get('/health', (_req: any, res: any) => res.json({ status: 'healthy' }));
 
-    console.log('[Routes] / /webview /health /clear /mic /prompt /upload /api/params /api/models /api/stream /tts-audio/:id registered');
+    console.log('[Routes] / /webview /health /clear /mic /prompt /upload /api/params /api/models /api/stream /tts-audio/:id /api/calibrate-speaker-gap registered');
   }
 }
 
@@ -2146,7 +2398,7 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
     const prefs = JSON.parse(raw);
     const s = getState(userId);
     if (typeof prefs.ttsEnabled === 'boolean')                         s.ttsEnabled = prefs.ttsEnabled;
-    if (prefs.ttsEngine === 'kokoro' || prefs.ttsEngine === 'elevenlabs') s.ttsEngine = prefs.ttsEngine;
+    if (prefs.ttsEngine === 'kokoro' || prefs.ttsEngine === 'elevenlabs' || prefs.ttsEngine === 'elevenlabs_direct') s.ttsEngine = prefs.ttsEngine;
     if (typeof prefs.micMuted   === 'boolean')                         s.micMuted   = prefs.micMuted;
     if (prefs.genParams) {
       if (prefs.genParams.systemPrompt)                    s.genParams.systemPrompt = prefs.genParams.systemPrompt;
@@ -2257,6 +2509,8 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession 
         setTimeout(() => {
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
+      } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
+        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -2443,6 +2697,8 @@ async function handleImagePrompt(
         setTimeout(() => {
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
+      } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
+        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -2819,6 +3075,58 @@ async function speakWithElevenLabs(session: AppSession | undefined, text: string
   } catch (err: any) {
     console.log(`[TTS] ElevenLabs error: ${err.message}`);
     broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs' });
+  }
+}
+
+async function speakWithElevenLabsDirect(userId: string, text: string, voiceId?: string): Promise<void> {
+  if (!ELEVENLABS_API_KEY) return;
+  try {
+    const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
+    const vid = (voiceId || ELEVENLABS_VOICE_ID) || 'EXAVITQu4vr4xnSDxMaL';
+    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}/stream`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text: safeText,
+        model_id: 'eleven_turbo_v2_5',
+        voice_settings: {
+          stability:        0.5,
+          similarity_boost: 0.75,
+          speed:            1.1,
+        },
+      }),
+    });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      console.log(`[TTS] ElevenLabs Direct error ${r.status}: ${errText.slice(0, 120)}`);
+      broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs_direct' });
+      return;
+    }
+    const audioBuffer = Buffer.from(await r.arrayBuffer());
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    audioCache.set(id, { buf: audioBuffer, expires: Date.now() + 300_000 });
+    const audioUrl = `/tts-audio/${id}`;
+    broadcastToUser(userId, 'tts_audio', { url: audioUrl });
+    console.log(`[TTS] ElevenLabs Direct → SSE audio push (${safeText.length} chars, voice: ${vid})`);
+    cancelAutoClearTimer(userId);
+    const ds = getState(userId);
+    ds.autoClearTimer = setTimeout(async () => {
+      ds.autoClearTimer = null;
+      const dSession = activeSessions.get(userId);
+      if (dSession) {
+        try { await dSession.layouts.clearView(); } catch {}
+        updateDashboard(dSession, 'Ready');
+        console.log(`[AutoClear] Display cleared for ${userId}`);
+      }
+    }, AUTO_CLEAR_DELAY_MS);
+    console.log(`[AutoClear] Timer started for ${userId} (${AUTO_CLEAR_DELAY_MS}ms) [post-ElevenDirect]`);
+  } catch (err: any) {
+    console.log(`[TTS] ElevenLabs Direct failed: ${err.message}`);
+    broadcastToUser(userId, 'tts_end', { engine: 'elevenlabs_direct' });
   }
 }
 
