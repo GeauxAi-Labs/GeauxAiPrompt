@@ -72,7 +72,6 @@ const activeSessions      = new Map<string, AppSession>();
 const devicePollIntervals = new Map<string, ReturnType<typeof setInterval>>();
 const rateLimits          = new Map<string, { count: number; resetTime: number }>();
 const audioCache          = new Map<string, { buf: Buffer; expires: number }>();
-let elevenLabsVoiceCache: { voices: { voice_id: string; name: string }[]; expires: number } | null = null;
 setInterval(() => {
   const now = Date.now();
   for (const [id, entry] of audioCache) {
@@ -2397,12 +2396,10 @@ class GeauxAIApp extends AppServer {
       ]});
     });
 
-    // GET /api/elevenlabs-voices — MentraOS path voice list (dynamic, cached 1hr, falls back to hardcoded)
-    // No API key required — uses ElevenLabs public shared-voices endpoint filtered to English.
-    app.get('/api/elevenlabs-voices', async (_req: any, res: any) => {
-      // ── Hardcoded fallback — used if ElevenLabs API is unreachable ────────
-      // Includes all original custom Voice Library voices so they are never lost.
-      const FALLBACK_VOICES = [
+    // GET /api/elevenlabs-voices — returns static hardcoded voice list (MentraOS path — Mentra's ElevenLabs account)
+    app.get('/api/elevenlabs-voices', (_req: any, res: any) => {
+      res.json({ voices: [
+        // ── YOUR CUSTOM VOICE LIBRARY VOICES (keep all originals) ──
         { voice_id: 'ZzBpNW0j7Iq2XRx6Xo49', name: 'Indian' },
         { voice_id: '7QwDAfHpHjPD14XYTSiq', name: 'Asian' },
         { voice_id: '0QT4OrDTvpDlUPmFsUWN', name: 'Lily Ausie' },
@@ -2428,6 +2425,7 @@ class GeauxAIApp extends AppServer {
         { voice_id: 'yp4MmTRKvE7VXY3hUJRY', name: 'Timi' },
         { voice_id: 'V2D1qkaFj5NormT9yoaK', name: 'Hoyeen' },
         { voice_id: 'TBvIh5TNCMX6pQNIcWV8', name: 'Chidiebere' },
+        // ── NEW DEFAULT VOICES (permanent, recommended) ──
         { voice_id: '9BWtsMINqrJLrRacOk9x', name: 'Aria (Female, American, Expressive)' },
         { voice_id: 'CwhRBWXzGAHq8TQ4Fs17', name: 'Roger (Male, American, Confident)' },
         { voice_id: 'FGY2WhTYpPnrIDTdsKH5', name: 'Laura (Female, American, Upbeat)' },
@@ -2448,6 +2446,7 @@ class GeauxAIApp extends AppServer {
         { voice_id: 'EXAVITQu4vr4xnSDxMaL', name: 'Sarah (Female, American, Soft)' },
         { voice_id: 'Xb7hH8MSUJpSbSDYk0k2', name: 'Alice (Female, British, Confident)' },
         { voice_id: 'pqHfZKP75CvOlQylNhV4', name: 'Bill (Male, American, Trustworthy)' },
+        // ── LEGACY PREMADE VOICES (expire Dec 31 2026) ──
         { voice_id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam (Male, American, Deep)' },
         { voice_id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (Male, American, Well-rounded)' },
         { voice_id: 'VR6AewLTigWG4xSOukaG', name: 'Arnold (Male, American, Crisp)' },
@@ -2479,54 +2478,7 @@ class GeauxAIApp extends AppServer {
         { voice_id: 'pMsXgVXv3BLzUgSXRplE', name: 'Serena (Female, American, Pleasant)' },
         { voice_id: 'GBv7mTt0atIp3Br8iCZE', name: 'Thomas (Male, American, Calm)' },
         { voice_id: 'knrPHWnBmmDHMoiMeP3l', name: 'Santa Claus (Male, Christmas)' },
-      ];
-
-      // ── Serve from cache if still valid ───────────────────────────────────
-      if (elevenLabsVoiceCache && Date.now() < elevenLabsVoiceCache.expires) {
-        return res.json({ voices: elevenLabsVoiceCache.voices, cached: true });
-      }
-
-      // ── Fetch live from ElevenLabs shared-voices (no API key required) ────
-      // Fetches up to 500 English-language shared voices sorted by usage/claps.
-      // The endpoint is public — no xi-api-key header needed.
-      try {
-        const r = await fetch(
-          'https://api.elevenlabs.io/v1/shared-voices?language=en&page_size=500&sort=usage_character_count_1y',
-          { headers: { 'Accept': 'application/json' } }
-        );
-        if (!r.ok) throw new Error(`ElevenLabs shared-voices error ${r.status}`);
-        const data = (await r.json()) as any;
-        const fetchedVoices: { voice_id: string; name: string }[] = [];
-        const seenIds = new Set<string>();
-
-        // Build a de-duplicated set from the fetched voices
-        for (const v of (data.voices || [])) {
-          if (!v.voice_id || !v.name) continue;
-          if (seenIds.has(v.voice_id)) continue;
-          seenIds.add(v.voice_id);
-          fetchedVoices.push({ voice_id: v.voice_id, name: v.name });
-        }
-
-        // Merge: pinned custom voices first (always present, always at top),
-        // then fetched voices (de-duplicated against pinned set).
-        // This guarantees Casey Kasem and other custom IDs never disappear
-        // even if they aren't in the public shared-voices results.
-        const PINNED_IDS = new Set(FALLBACK_VOICES.map(v => v.voice_id));
-        const merged = [
-          ...FALLBACK_VOICES,
-          ...fetchedVoices.filter(v => !PINNED_IDS.has(v.voice_id)),
-        ];
-
-        // Cache for 1 hour
-        elevenLabsVoiceCache = { voices: merged, expires: Date.now() + 3_600_000 };
-        console.log(`[ElevenVoices] Fetched ${fetchedVoices.length} shared voices, merged to ${merged.length} total`);
-        return res.json({ voices: merged, cached: false });
-
-      } catch (err: any) {
-        // API unreachable — serve fallback silently, do not cache the failure
-        console.log(`[ElevenVoices] Shared-voices fetch failed: ${err.message} — serving fallback`);
-        return res.json({ voices: FALLBACK_VOICES, cached: false, fallback: true });
-      }
+      ]});
     });
 
     app.get('/tts-audio/:id', (req: any, res: any) => {
