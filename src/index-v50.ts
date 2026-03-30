@@ -41,9 +41,11 @@ interface GenParams {
   webSearch:    boolean;
   useCloudflare: boolean;
   elevenLabsVoiceId: string;
+  elevenDirectVoiceId:  string;
   elevenPathPref:    'mentraos' | 'geauxai';
   kokoroVoice: string;
-  avatarEnabled: boolean;
+  avatarEnabled:     boolean;
+  browserMicEnabled: boolean;
 }
 
 interface UserState {
@@ -86,12 +88,15 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   webSearch:    true,
   useCloudflare: false,
   elevenLabsVoiceId: '',
+  elevenDirectVoiceId: '',
   elevenPathPref:    'mentraos' as 'mentraos' | 'geauxai',
   kokoroVoice: '',
-  avatarEnabled: true,
+  avatarEnabled:     true,
+  browserMicEnabled: false,
 };
 
 DEFAULT_GEN_PARAMS.elevenLabsVoiceId = ELEVENLABS_VOICE_ID;
+DEFAULT_GEN_PARAMS.elevenDirectVoiceId = '';
 DEFAULT_GEN_PARAMS.elevenPathPref = 'mentraos';
 DEFAULT_GEN_PARAMS.kokoroVoice = KOKORO_VOICE;
 
@@ -271,6 +276,16 @@ function buildPage(
   --ui:'Syne',sans-serif;
   --rad:12px;
 }
+[data-theme="light"]{
+  --bg:#f5f3ff;--bg2:#ede9fe;--bg3:#ffffff;
+  --glass:#7c3aed0a;--glass2:#7c3aed14;
+  --edge:#7c3aed1a;--edge2:#7c3aed28;
+  --v:#7c3aed;--v2:#a855f7;--v3:#6d28d9;
+  --c:#0891b2;--c2:#0e7490;
+  --g:#059669;--g2:#047857;
+  --a:#d97706;--r:#dc2626;
+  --tx:#1e1b4b;--tx2:#4c1d95;--tx3:#7c3aed;
+}
 html{height:100%;-webkit-text-size-adjust:100%}
 body{
   min-height:100%;background:var(--bg);color:var(--tx);font-family:var(--ui);
@@ -279,6 +294,7 @@ body{
     radial-gradient(ellipse 40% 25% at 85% 75%,#0a3d4a14 0%,transparent 55%);
   background-attachment:fixed;
 }
+[data-theme="light"] body{background-image:radial-gradient(ellipse 70% 40% at 50% 0%,#7c3aed12 0%,transparent 65%),radial-gradient(ellipse 40% 25% at 85% 75%,#0891b20e 0%,transparent 55%)}
 .shell{display:flex;flex-direction:column;min-height:100dvh;max-width:540px;margin:0 auto}
 
 /* Header */
@@ -320,6 +336,7 @@ body{
 .chip-engine{border-color:var(--v2);color:var(--v3)}
 .chip-x{border-color:var(--edge);color:var(--tx3)}
 .chip-x:active{background:var(--glass);border-color:#ef444460;color:var(--r)}
+.chip-theme{border-color:var(--edge);color:var(--tx2);font-size:12px;padding:3px 7px}
 
 /* Status bar */
 .sbar{
@@ -336,7 +353,7 @@ body{
 /* Listening bar */
 .lbar{
   display:none;padding:8px 14px;
-  background:linear-gradient(90deg,transparent,#1c1034 15%,#1c1034 85%,transparent);
+  background:linear-gradient(90deg,transparent,var(--bg2) 15%,var(--bg2) 85%,transparent);
   border-bottom:1px solid #7c3aed28;
   font-family:var(--mono);font-size:11px;color:var(--v3);
   align-items:flex-start;gap:8px;
@@ -442,11 +459,7 @@ kbd{
   padding:9px 12px;border-radius:10px;
   font-size:13.5px;line-height:1.6;word-break:break-word;
 }
-.msg-u .msg-body{
-  background:linear-gradient(135deg,#2a1a4a,#1a0e38);
-  border:1px solid #7c3aed28;border-bottom-right-radius:3px;
-  max-width:90%;align-self:flex-end;
-}
+.msg-u .msg-body { background: #7c3aed; color: #ffffff; border-bottom-right-radius: 3px; max-width: 90%; align-self: flex-end; }
 .msg-a .msg-body{
   background:var(--glass);border:1px solid var(--edge);
   border-bottom-left-radius:3px;max-width:94%;
@@ -476,7 +489,7 @@ kbd{
   min-height:38px;max-height:100px;
   transition:border-color .15s;-webkit-appearance:none;
 }
-.ft-inp:focus{border-color:var(--v2);background:#18122e}
+.ft-inp:focus{border-color:var(--v2);background:var(--bg3)}
 .ft-inp::placeholder{color:var(--tx3)}
 .ft-go{
   flex-shrink:0;width:38px;height:38px;
@@ -569,11 +582,17 @@ kbd{
         window._pendingReloadWhileOverlay=true;
       } else if(inp && inp.value.trim().length>0){
         inp.dataset.pendingReload='1';
+      } else if(window._brMicRunning){
+        _refreshFeed();
       } else {
         window.location.reload();
       }
     }
+    document.dispatchEvent(new CustomEvent('geaux:stateupdate',{detail:d}));
   }
+
+  function _refreshFeed(){ fetch('/webview',{credentials:'include'}).then(function(r){return r.ok?r.text():null;}).then(function(html){ if(!html) return; var doc=(new DOMParser()).parseFromString(html,'text/html'); var nf=doc.getElementById('feed'); var cf=document.getElementById('feed'); if(nf&&cf){ cf.innerHTML=nf.innerHTML; cf.scrollTop=cf.scrollHeight; } var ns=doc.querySelector('.scount'); var sbar=document.querySelector('.sbar'); if(sbar){ var os=sbar.querySelector('.scount'); if(ns&&os) os.outerHTML=ns.outerHTML; else if(ns&&!os){ var logBtn=document.getElementById('sbar-log-btn'); if(logBtn) sbar.insertBefore(ns.cloneNode(true),logBtn); } else if(!ns&&os) os.remove(); } }).catch(function(){}); }
+  window._refreshFeed = _refreshFeed;
 
   function applyListening(d){
     var bar=document.getElementById('lbar');
@@ -694,6 +713,7 @@ kbd{
     <form method="POST" action="/clear" style="margin:0">
       <button type="submit" class="chip chip-x">✕ CLEAR</button>
     </form>
+    <button class="chip chip-theme" id="chip-theme" onclick="toggleTheme()" title="Toggle light/dark theme">🌙</button>
   </div>
 </header>
 
@@ -725,8 +745,12 @@ kbd{
   <select class="p-sel" id="p-eleven-path"><option value="mentraos">MentraOS (via SDK)</option><option value="geauxai">GeauxAI (direct API)</option></select>
 </div>
 <div class="p-row" id="p-row-eleven-voice">
-  <span class="p-lbl">ELEVENLABS VOICE <span class="p-hint">— voice used when ELEVEN engine is selected</span></span>
+  <span class="p-lbl">ELEVEN VOICE — MentraOS <span class="p-hint">— paid library voices, used when ELEVEN (MentraOS) engine is active</span></span>
   <select class="p-sel" id="p-eleven-voice"><option value="">Default (from .env)</option></select>
+</div>
+<div class="p-row" id="p-row-eleven-direct-voice">
+  <span class="p-lbl">ELEVEN VOICE — Direct <span class="p-hint">— free tier premade voices, used when ELEVEN (Direct) engine is active</span></span>
+  <select class="p-sel" id="p-eleven-direct-voice"><option value="">Default (Rachel)</option></select>
 </div>` : ''}
     ${KOKORO_HOST ? `
 <div class="p-row" id="p-row-kokoro-voice">
@@ -745,6 +769,13 @@ kbd{
       <div class="p-tog-row">
         <label class="tsw"><input type="checkbox" id="p-ws"><span class="ttrack"></span></label>
         <span class="thint" id="p-ws-hint">OFF — model knowledge only</span>
+      </div>
+    </div>
+    <div class="p-row">
+      <span class="p-lbl">BROWSER MIC <span class="p-hint">— enable browser microphone when glasses are offline. No wake word needed. Sends speech directly to AI.</span></span>
+      <div class="p-tog-row">
+        <label class="tsw"><input type="checkbox" id="p-browser-mic"><span class="ttrack"></span></label>
+        <span class="thint" id="p-browser-mic-hint">OFF — browser mic disabled</span>
       </div>
     </div>
     <div class="p-row">
@@ -826,6 +857,7 @@ kbd{
   var sp=new URLSearchParams(window.location.search);
   var tok=sp.get('token')||sp.get('t')||'';
   var authQ=tok?('?'+(sp.get('token')?'token':'t')+'='+encodeURIComponent(tok)):'';
+  var brWakeWord='${WAKE_WORD}';
   var pOpen=false;
   var transcriptLog=(function(){try{var s=localStorage.getItem('geaux_tlog');return s?JSON.parse(s):[];}catch(e){return [];}})();
   var overlayOpen=false;
@@ -865,8 +897,10 @@ kbd{
         useCloudflare:cf?cf.checked:false,
         elevenPathPref:document.getElementById('p-eleven-path')?document.getElementById('p-eleven-path').value:'mentraos',
         elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
+        elevenDirectVoiceId:document.getElementById('p-eleven-direct-voice')?document.getElementById('p-eleven-direct-voice').value:'',
         kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
         ,avatarEnabled:avatarEl?!!avatarEl.checked:true
+        ,browserMicEnabled:document.getElementById('p-browser-mic')?!!document.getElementById('p-browser-mic').checked:false
       })
     }).catch(function(){});
   }
@@ -906,6 +940,23 @@ kbd{
         });
       }).catch(function(){});
   }
+  function refreshElevenDirectVoices(selectedId) {
+    fetch('/api/elevenlabs-voices-free' + authQ)
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d || !d.voices) return;
+        var sel = document.getElementById('p-eleven-direct-voice');
+        if (!sel) return;
+        while (sel.options.length > 1) sel.remove(1);
+        d.voices.forEach(function(v){
+          var opt = document.createElement('option');
+          opt.value = v.voice_id;
+          opt.textContent = v.name;
+          if (selectedId && v.voice_id === selectedId) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      }).catch(function(){});
+  }
   function refreshKokoroVoices(selectedId) {
     fetch('/api/kokoro-voices' + authQ)
       .then(function(r){ return r.ok ? r.json() : null; })
@@ -926,6 +977,7 @@ kbd{
   // Initial load
   refreshModels('ollama');
   refreshElevenVoices();
+  refreshElevenDirectVoices();
   refreshKokoroVoices();
 
   fetch('/api/params'+authQ)
@@ -959,6 +1011,7 @@ kbd{
         refreshModels(d.useCloudflare?'cloudflare':'ollama');
       }
       refreshElevenVoices(d.elevenLabsVoiceId || '');
+      refreshElevenDirectVoices(d.elevenDirectVoiceId || '');
       var _ep=document.getElementById('p-eleven-path'); if(_ep && d.elevenPathPref) _ep.value=d.elevenPathPref;
       refreshKokoroVoices(d.kokoroVoice || '');
       var avatarEl=document.getElementById('p-avatar');
@@ -967,6 +1020,7 @@ kbd{
         avatarEl.checked=!!d.avatarEnabled;
         if(avatarHint) avatarHint.textContent=d.avatarEnabled?'ON — avatar appears during speech':'OFF — avatar hidden';
       }
+      var bmEl=document.getElementById('p-browser-mic'); var bmHint=document.getElementById('p-browser-mic-hint'); if(bmEl&&d.browserMicEnabled!==undefined){bmEl.checked=!!d.browserMicEnabled; if(bmHint) bmHint.textContent=d.browserMicEnabled?'ON — browser mic active when offline':'OFF — browser mic disabled'; if(d.browserMicEnabled && !_glassesConnected){ setTimeout(_startBrowserMic, 800); }}
     }).catch(function(){});
 
   var tempEl=document.getElementById('p-temp'),tvEl=document.getElementById('p-tv');
@@ -1007,8 +1061,12 @@ kbd{
   var elevenPathEl=document.getElementById('p-eleven-path'); if(elevenPathEl) elevenPathEl.addEventListener('change',sendParams);
   var elevVoiceEl = document.getElementById('p-eleven-voice');
   if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
+  var elevDirectVoiceEl=document.getElementById('p-eleven-direct-voice'); if(elevDirectVoiceEl) elevDirectVoiceEl.addEventListener('change',sendParams);
   var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
   if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
+  var bmTogEl=document.getElementById('p-browser-mic'); var bmTogHint=document.getElementById('p-browser-mic-hint');
+  if(bmTogEl) bmTogEl.addEventListener('change',function(){ var on=bmTogEl.checked; if(bmTogHint) bmTogHint.textContent=on?'ON — browser mic active when offline':'OFF — browser mic disabled'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:on})}).catch(function(){}); if(on && !_glassesConnected){ _startBrowserMic(); } else { _stopBrowserMic(); } });
+  var micFormBtn=document.getElementById('sse-mic'); if(micFormBtn){ micFormBtn.closest('form').addEventListener('submit',function(ev){ if(_brEnabled){ ev.preventDefault(); var isMuted=micFormBtn.classList.contains('muted'); micFormBtn.classList.toggle('muted',!isMuted); micFormBtn.textContent=isMuted?'🎤 MIC ON':'🔇 MUTED'; fetch('/mic'+authQ,{method:'POST'}).catch(function(){}); } }); }
   var avTogEl=document.getElementById('p-avatar');
   var avTogHint=document.getElementById('p-avatar-hint');
   if(avTogEl) avTogEl.addEventListener('change',function(){
@@ -1016,6 +1074,9 @@ kbd{
     if(avTogHint) avTogHint.textContent=on?'ON — avatar appears during speech':'OFF — avatar hidden';
     fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({avatarEnabled:on})}).catch(function(){});
   });
+
+  window.toggleTheme=function(){ var html=document.documentElement; var isLight=html.getAttribute('data-theme')==='light'; html.setAttribute('data-theme',isLight?'dark':'light'); var btn=document.getElementById('chip-theme'); if(btn) btn.textContent=isLight?'🌙':'☀️'; try{localStorage.setItem('geauxai-theme',isLight?'dark':'light');}catch(e){} };
+  (function(){ try{ var t=localStorage.getItem('geauxai-theme'); if(t==='light'){ document.documentElement.setAttribute('data-theme','light'); var btn=document.getElementById('chip-theme'); if(btn) btn.textContent='☀️'; } }catch(e){} })();
 
   window.toggleTTSEngine=function(){
     fetch('/tts-engine'+authQ,{method:'POST'})
@@ -1105,7 +1166,7 @@ kbd{
     overlayOpen=false;window._transcriptOverlayOpen=false;
     var ov=document.getElementById('transcript-overlay');
     if(ov){ov.style.transform='translateY(100%)';ov.style.pointerEvents='none';}
-    if(window._pendingReloadWhileOverlay){window._pendingReloadWhileOverlay=false;window.location.reload();}
+    if(window._pendingReloadWhileOverlay){window._pendingReloadWhileOverlay=false;if(window._brMicRunning&&window._refreshFeed){window._refreshFeed();}else{window.location.reload();}}
   };
 
   window.clearTranscriptLog=function(){
@@ -1374,6 +1435,58 @@ kbd{
   }
   if(btn) btn.addEventListener('click',doSend);
   if(inp) inp.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend();}});
+
+  // ── Browser Mic (Web Speech API) — offline path ───────────────────
+  var _glassesConnected = false;
+  var _browserMicActive = false;
+  var _browserMicMuted  = false;
+  var _brRecog          = null;
+  var _brRestarting     = false;
+  var _brEnabled        = false;
+  var _brLastSent       = '';
+  var _brLastSentTime   = 0;
+  var _brNoSpeechBackoff = false;
+  var _brAborted        = false;
+
+  function _startBrowserMic(){
+    _brEnabled = true; window._brMicRunning = true;
+    if(_browserMicActive) return;
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if(!SR){ console.warn('[BrowserMic] SpeechRecognition not supported'); return; }
+    if(_brRecog){ try{ _brRecog.stop(); }catch(e){} _brRecog=null; }
+    var r = new SR();
+    r.continuous = false;
+    r.interimResults = true;
+    r.lang = 'en-US';
+    r.onstart = function(){ _browserMicActive=true; _brNoSpeechBackoff=false; _brAborted=false; console.log('[BrowserMic] started'); };
+    r.onerror = function(ev){ _browserMicActive=false; if(ev.error==='not-allowed'||ev.error==='service-not-allowed'){ console.warn('[BrowserMic] permission denied'); _brEnabled=false; window._brMicRunning=false; var bm=document.getElementById('p-browser-mic'); if(bm) bm.checked=false; var bh=document.getElementById('p-browser-mic-hint'); if(bh) bh.textContent='OFF \u2014 microphone permission denied'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:false})}).catch(function(){}); } else if(ev.error==='no-speech'){ _brNoSpeechBackoff=true; } else if(ev.error==='aborted'){ _brAborted=true; } else { console.warn('[BrowserMic] error:',ev.error); } };
+    r.onend = function(){ _browserMicActive=false; _brRecog=null; if(!_brEnabled || _glassesConnected || _browserMicMuted || _brRestarting) return; _brRestarting=true; var delay=_brNoSpeechBackoff?1500:(_brAborted?500:250); _brNoSpeechBackoff=false; _brAborted=false; setTimeout(function(){ _brRestarting=false; if(_brEnabled && !_glassesConnected && !_browserMicMuted) _startBrowserMic(); }, delay); };
+    r.onresult = function(ev){ if(_browserMicMuted||_glassesConnected) return; var interim=''; var final_=''; for(var i=ev.resultIndex;i<ev.results.length;i++){ if(ev.results[i].isFinal){ final_+=ev.results[i][0].transcript; } else { interim+=ev.results[i][0].transcript; } } if(interim.trim()){ var lb=document.getElementById('lbar'); var lt=document.getElementById('ltxt'); if(lb) lb.style.display='flex'; if(lt) lt.textContent=interim; } if(final_.trim()){ var fLow=final_.trim().toLowerCase(); if(!fLow.startsWith(brWakeWord)) return; var stripped=final_.trim().slice(brWakeWord.length).replace(/^[,\s]+/,'').trim(); if(!stripped) return; var now3=new Date(); var nowMs=now3.getTime(); if(stripped===_brLastSent && nowMs-_brLastSentTime<4000) return; _brLastSent=stripped; _brLastSentTime=nowMs; var ts3=now3.toTimeString().slice(0,8); var lb2=document.getElementById('lbar'); if(lb2) lb2.style.display='none'; var lt2=document.getElementById('ltxt'); if(lt2) lt2.textContent=''; console.log('[BrowserMic] wake word: '+stripped); window.dispatchEvent(new CustomEvent('geaux:transcript',{detail:{ts:ts3,text:final_.trim()}})); fetch('/prompt'+authQ,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text='+encodeURIComponent(stripped)}).catch(function(){}); } };
+    _brRecog = r;
+    try{ r.start(); } catch(e){ console.warn('[BrowserMic] start failed:',e); _browserMicActive=false; }
+  }
+
+  function _stopBrowserMic(){
+    _brEnabled=false; window._brMicRunning=false;
+    _brRestarting=false; _brNoSpeechBackoff=false; _brAborted=false;
+    _browserMicActive=false;
+    if(_brRecog){ try{ _brRecog.stop(); }catch(e){} _brRecog=null; }
+    var lb=document.getElementById('lbar'); if(lb) lb.style.display='none';
+    console.log('[BrowserMic] stopped');
+  }
+
+  // Hook into SSE state to track glasses connection and mute state
+  var _origApplyState = window._applyStateFn || null;
+  document.addEventListener('geaux:stateupdate', function(ev){
+    var d = ev.detail;
+    var wasConnected = _glassesConnected;
+    _glassesConnected = !!d.connected;
+    _browserMicMuted  = !!d.micMuted;
+    // Glasses just connected — stop browser mic immediately
+    if(!wasConnected && _glassesConnected && _browserMicActive){ _stopBrowserMic(); console.log('[BrowserMic] glasses connected — stopped browser mic'); }
+    // Glasses just disconnected — restart browser mic if enabled
+    if(wasConnected && !_glassesConnected && _brEnabled && !_browserMicMuted){ _startBrowserMic(); }
+  });
 
   // Scroll feed to bottom
   var feed=document.getElementById('feed');
@@ -2203,6 +2316,8 @@ class GeauxAIApp extends AppServer {
         s.genParams.useCloudflare = b.useCloudflare;
       if (typeof b.elevenLabsVoiceId === 'string')
         s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
+      if (typeof b.elevenDirectVoiceId === 'string')
+        s.genParams.elevenDirectVoiceId = b.elevenDirectVoiceId;
       if (b.elevenPathPref === 'mentraos' || b.elevenPathPref === 'geauxai')
         s.genParams.elevenPathPref = b.elevenPathPref;
       // Sync ttsEngine with elevenPathPref when ELEVEN is active
@@ -2213,6 +2328,8 @@ class GeauxAIApp extends AppServer {
         s.genParams.kokoroVoice = b.kokoroVoice;
       if (typeof b.avatarEnabled === 'boolean')
         s.genParams.avatarEnabled = b.avatarEnabled;
+      if (typeof b.browserMicEnabled === 'boolean')
+        s.genParams.browserMicEnabled = b.browserMicEnabled;
       console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
       const sess = activeSessions.get(userId);
       if (sess) {
@@ -2256,6 +2373,27 @@ class GeauxAIApp extends AppServer {
         // Return empty list if Kokoro is not running or unreachable
         res.json({ voices: [] });
       }
+    });
+
+    // GET /api/elevenlabs-voices-free — ElevenLabs premade/default voices, available on free tier via direct API
+    app.get('/api/elevenlabs-voices-free', (_req: any, res: any) => {
+      res.json({ voices: [
+        { voice_id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (Female, American)' },
+        { voice_id: 'pNInz6obpgDQGcFmaJgB', name: 'Adam (Male, American, Deep)' },
+        { voice_id: 'Xb7hH8MSUJpSbSDYk0k2', name: 'Alice (Female, British)' },
+        { voice_id: 'pqHfZKP75CvOlQylNhV4', name: 'Bill (Male, American)' },
+        { voice_id: 'IKne3meq5aSn9XLyUdCD', name: 'Charlie (Male, Australian)' },
+        { voice_id: 'XB0fDUnXU5powFXDhCwa', name: 'Charlotte (Female, Swedish)' },
+        { voice_id: 'iP95p4xoKVk53GoZ742B', name: 'Chris (Male, American)' },
+        { voice_id: 'onwK4e9ZLuTAKqWW03F9', name: 'Daniel (Male, British, Authoritative)' },
+        { voice_id: 'cjVigY5qzO86Huf0OWal', name: 'Eric (Male, American)' },
+        { voice_id: 'jsCqWAovK2LkecY7zXl4', name: 'Freya (Female, American)' },
+        { voice_id: 'JBFqnCBsd6RMkjVDRZzb', name: 'George (Male, British)' },
+        { voice_id: 'TX3LPaxmHKxFdv7VOQHJ', name: 'Liam (Male, American)' },
+        { voice_id: 'XrExE9yKIg1WjnnlVkGX', name: 'Matilda (Female, American, Warm)' },
+        { voice_id: 'SAz9YHcvj6GT2YYXdXww', name: 'River (Neutral, American)' },
+        { voice_id: 'bIHbv24MWmeRgasZH58o', name: 'Will (Male, American, Friendly)' },
+      ]});
     });
 
     // GET /api/elevenlabs-voices — returns static hardcoded voice list
@@ -2408,8 +2546,10 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
       if (prefs.genParams.model)                           s.genParams.model        = prefs.genParams.model;
       if (typeof prefs.genParams.useCloudflare === 'boolean') s.genParams.useCloudflare = prefs.genParams.useCloudflare;
       if (typeof prefs.genParams.elevenLabsVoiceId === 'string') s.genParams.elevenLabsVoiceId = prefs.genParams.elevenLabsVoiceId;
+      if (typeof prefs.genParams.elevenDirectVoiceId === 'string') s.genParams.elevenDirectVoiceId = prefs.genParams.elevenDirectVoiceId;
       if (typeof prefs.genParams.kokoroVoice === 'string') s.genParams.kokoroVoice = prefs.genParams.kokoroVoice;
       if (typeof prefs.genParams.avatarEnabled === 'boolean') s.genParams.avatarEnabled = prefs.genParams.avatarEnabled;
+      if (typeof prefs.genParams.browserMicEnabled === 'boolean') s.genParams.browserMicEnabled = prefs.genParams.browserMicEnabled;
     }
     console.log(`[Storage] Loaded prefs for ${userId}: tts=${s.ttsEnabled} engine=${s.ttsEngine} mic=${s.micMuted ? 'off' : 'on'}`);
   } catch (err: any) {
@@ -2510,7 +2650,7 @@ async function handlePrompt(userId: string, prompt: string, session: AppSession 
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
       } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
+        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenDirectVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -2698,7 +2838,7 @@ async function handleImagePrompt(
           broadcastToUser(userId, 'tts_start', { engine: 'elevenlabs', estimatedMs: elevenEstMs });
         }, 1200);
       } else if (state.ttsEngine === 'elevenlabs_direct' && ELEVENLABS_API_KEY) {
-        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenLabsVoiceId || undefined).catch(() => {});
+        speakWithElevenLabsDirect(userId, clean, state.genParams.elevenDirectVoiceId || undefined).catch(() => {});
       }
     }
 
@@ -3082,7 +3222,7 @@ async function speakWithElevenLabsDirect(userId: string, text: string, voiceId?:
   if (!ELEVENLABS_API_KEY) return;
   try {
     const safeText = text.length > 10000 ? text.slice(0, 9997) + '...' : text;
-    const vid = (voiceId || ELEVENLABS_VOICE_ID) || 'EXAVITQu4vr4xnSDxMaL';
+    const vid = voiceId || '21m00Tcm4TlvDq8ikWAM';
     const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}/stream`, {
       method: 'POST',
       headers: {
@@ -3092,7 +3232,7 @@ async function speakWithElevenLabsDirect(userId: string, text: string, voiceId?:
       },
       body: JSON.stringify({
         text: safeText,
-        model_id: 'eleven_turbo_v2_5',
+        model_id: 'eleven_flash_v2',
         voice_settings: {
           stability:        0.5,
           similarity_boost: 0.75,
