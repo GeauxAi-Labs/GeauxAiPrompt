@@ -755,9 +755,8 @@ kbd{
 </div>` : ''}
     ${KOKORO_HOST ? `
 <div class="p-row" id="p-row-kokoro-voice">
-  <span class="p-lbl">KOKORO VOICE BLEND <span class="p-hint">— select multiple voices to blend. Ctrl/Cmd+click to add. Order sets blend mix.</span></span>
-  <select class="p-sel" id="p-kokoro-voice" multiple size="5" style="height:auto;min-height:80px;border-radius:8px;padding:4px 2px;"></select>
-  <div style="display:flex;align-items:center;gap:6px;margin-top:5px;"><span style="font-family:var(--mono);font-size:9px;color:var(--tx3);">BLEND:</span><span id="p-kokoro-blend-preview" style="font-family:var(--mono);font-size:9px;color:var(--v3);flex:1;word-break:break-all;">Default (from .env)</span><button type="button" id="p-kokoro-clear" style="font-family:var(--mono);font-size:8px;padding:2px 7px;background:transparent;border:1px solid var(--edge);border-radius:4px;color:var(--tx3);cursor:pointer;">CLEAR</button></div>
+  <span class="p-lbl">KOKORO VOICE <span class="p-hint">— voice used when KOKORO engine is selected. Supports blending: af_bella+af_sky</span></span>
+  <select class="p-sel" id="p-kokoro-voice"><option value="">Default (from .env)</option></select>
 </div>` : ''}
     <div class="p-row">
       <span class="p-lbl">AI PROVIDER <span class="p-hint">— switch between local Ollama and Cloudflare cloud AI</span></span>
@@ -900,7 +899,7 @@ kbd{
         elevenPathPref:document.getElementById('p-eleven-path')?document.getElementById('p-eleven-path').value:'mentraos',
         elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
         elevenDirectVoiceId:document.getElementById('p-eleven-direct-voice')?document.getElementById('p-eleven-direct-voice').value:'',
-        kokoroVoice:_getKokoroBlendValue()
+        kokoroVoice:kokoroVoiceEl?kokoroVoiceEl.value:''
         ,avatarEnabled:avatarEl?!!avatarEl.checked:true
         ,browserMicEnabled:document.getElementById('p-browser-mic')?!!document.getElementById('p-browser-mic').checked:false
       })
@@ -959,38 +958,21 @@ kbd{
         });
       }).catch(function(){});
   }
-  function _updateKokoroBlendPreview() {
-    var sel = document.getElementById('p-kokoro-voice');
-    var preview = document.getElementById('p-kokoro-blend-preview');
-    if (!sel || !preview) return;
-    var selected = [];
-    for (var i = 0; i < sel.options.length; i++) { if (sel.options[i].selected) selected.push(sel.options[i].value); }
-    preview.textContent = selected.length > 0 ? selected.join('+') : 'Default (from .env)';
-  }
-  function _getKokoroBlendValue() {
-    var sel = document.getElementById('p-kokoro-voice');
-    if (!sel) return '';
-    var selected = [];
-    for (var i = 0; i < sel.options.length; i++) { if (sel.options[i].selected) selected.push(sel.options[i].value); }
-    return selected.join('+');
-  }
-  function refreshKokoroVoices(selectedVoice) {
+  function refreshKokoroVoices(selectedId) {
     fetch('/api/kokoro-voices' + authQ)
       .then(function(r){ return r.ok ? r.json() : null; })
       .then(function(d){
         if (!d || !d.voices) return;
         var sel = document.getElementById('p-kokoro-voice');
         if (!sel) return;
-        while (sel.options.length > 0) sel.remove(0);
-        var selected = selectedVoice ? selectedVoice.split('+').map(function(s){ return s.trim(); }) : [];
+        while (sel.options.length > 1) sel.remove(1);
         d.voices.forEach(function(v){
           var opt = document.createElement('option');
           opt.value = v;
           opt.textContent = v;
-          if (selected.indexOf(v) !== -1) opt.selected = true;
+          if (selectedId && v === selectedId) opt.selected = true;
           sel.appendChild(opt);
         });
-        _updateKokoroBlendPreview();
       }).catch(function(){});
   }
   // Initial load
@@ -1082,9 +1064,7 @@ kbd{
   if (elevVoiceEl) elevVoiceEl.addEventListener('change', sendParams);
   var elevDirectVoiceEl=document.getElementById('p-eleven-direct-voice'); if(elevDirectVoiceEl) elevDirectVoiceEl.addEventListener('change',sendParams);
   var kokoroVoiceEl = document.getElementById('p-kokoro-voice');
-  if (kokoroVoiceEl) { kokoroVoiceEl.addEventListener('change', function(){ _updateKokoroBlendPreview(); sendParams(); }); }
-  var kokoroClearBtn = document.getElementById('p-kokoro-clear');
-  if (kokoroClearBtn) { kokoroClearBtn.addEventListener('click', function(){ var s=document.getElementById('p-kokoro-voice'); if(s){for(var i=0;i<s.options.length;i++)s.options[i].selected=false;} _updateKokoroBlendPreview(); sendParams(); }); }
+  if (kokoroVoiceEl) kokoroVoiceEl.addEventListener('change', sendParams);
   var bmTogEl=document.getElementById('p-browser-mic'); var bmTogHint=document.getElementById('p-browser-mic-hint');
   if(bmTogEl) bmTogEl.addEventListener('change',function(){ var on=bmTogEl.checked; if(bmTogHint) bmTogHint.textContent=on?'ON — browser mic active when offline':'OFF — browser mic disabled'; fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({browserMicEnabled:on})}).catch(function(){}); if(on && !_glassesConnected){ _startBrowserMic(); } else { _stopBrowserMic(); } });
   var micFormBtn=document.getElementById('sse-mic'); if(micFormBtn){ micFormBtn.closest('form').addEventListener('submit',function(ev){ if(_brEnabled){ ev.preventDefault(); var isMuted=micFormBtn.classList.contains('muted'); micFormBtn.classList.toggle('muted',!isMuted); micFormBtn.textContent=isMuted?'🎤 MIC ON':'🔇 MUTED'; fetch('/mic'+authQ,{method:'POST'}).catch(function(){}); } }); }
