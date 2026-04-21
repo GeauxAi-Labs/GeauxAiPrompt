@@ -309,7 +309,7 @@ body{
   padding:6px 14px;
   padding-bottom:max(8px,env(safe-area-inset-bottom,8px));
   border-top:1px solid var(--edge);
-  display:flex;flex-direction:column;align-items:stretch;gap:6px;
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
 }
 .hd-brand{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
 .logo-img{width:32px;height:32px;flex-shrink:0;border-radius:9px;object-fit:contain;}
@@ -347,7 +347,7 @@ body{
 
 /* Status bar */
 .sbar{
-  display:flex;align-items:center;gap:8px;padding:11px 14px;
+  display:flex;align-items:center;gap:8px;padding:5px 14px;
   background:var(--glass);border-bottom:1px solid var(--edge);flex-shrink:0;
   font-family:var(--mono);font-size:10px;color:var(--tx3);
 }
@@ -834,9 +834,9 @@ kbd{
   </header>
 </div>
 <div id="transcript-overlay" style="position:fixed;inset:0;z-index:500;background:var(--bg);display:flex;flex-direction:column;transform:translateY(100%);transition:transform 250ms ease;font-family:var(--mono);pointer-events:none;">
-  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
-    <button onclick="closeTranscriptLog()" style="background:transparent;border:1px solid var(--edge);border-radius:6px;color:var(--tx2);font-size:13px;width:36px;height:36px;flex-shrink:0;cursor:pointer;">✕</button>
-    <span style="font-size:11px;font-weight:700;letter-spacing:.12em;color:var(--v3);flex:1;">\uD83D\uDCCB TRANSCRIPTION LOG <span id="tlog-count" style="opacity:.6;font-weight:400;">(0)</span></span>
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
+    <span style="font-size:11px;font-weight:700;letter-spacing:.12em;color:var(--v3);">\uD83D\uDCCB TRANSCRIPTION LOG <span id="tlog-count" style="opacity:.6;font-weight:400;">(0)</span></span>
+    <button onclick="closeTranscriptLog()" style="background:transparent;border:1px solid var(--edge);border-radius:6px;color:var(--tx2);font-size:13px;width:28px;height:28px;cursor:pointer;">✕</button>
   </div>
   <div id="tlog-list" style="flex:1;overflow-y:auto;padding:12px 16px;">
     <div id="tlog-empty" style="text-align:center;color:var(--tx3);font-size:10px;padding:40px 0;letter-spacing:.06em;">No transcriptions yet this session</div>
