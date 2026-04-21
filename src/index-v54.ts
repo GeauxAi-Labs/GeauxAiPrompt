@@ -706,6 +706,7 @@ kbd{
   <div class="sdot ${dotClass}"></div>
   <div class="stxt" id="stxt">${statusText}</div>
   ${promptCount > 0 ? `<span class="scount">${promptCount} prompt${promptCount !== 1 ? 's' : ''}</span>` : ''}
+  <button id="sbar-log-btn" onclick="openTranscriptLog()" title="View transcription log" style="background:transparent;border:none;cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--tx3);padding:1px 4px;flex-shrink:0;opacity:0.55;">📋</button>
 </div>
 
 <div id="lbar" class="lbar">
@@ -817,8 +818,6 @@ kbd{
       <div class="hd-text">
         <div class="hd-name">GEAUXAI LABS / GEAUXAIPROMPT</div>
       </div>
-      <button id="sbar-log-btn" onclick="openTranscriptLog()" title="View transcription log" style="background:transparent;border:none;cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--tx3);padding:1px 4px;flex-shrink:0;opacity:0.55;">📋</button>
-      <button class="chip chip-theme" id="chip-theme" onclick="toggleTheme()" title="Toggle light/dark theme">🌙</button>
     </div>
     <div class="hd-right">
       <div id="chip-status" class="chip chip-status ${statusChipClass}">${statusChipLabel}</div>
@@ -830,6 +829,7 @@ kbd{
       <form method="POST" action="/clear" style="margin:0">
         <button type="submit" class="chip chip-x">✕ CLEAR</button>
       </form>
+      <button class="chip chip-theme" id="chip-theme" onclick="toggleTheme()" title="Toggle light/dark theme">🌙</button>
     </div>
   </header>
 </div>
