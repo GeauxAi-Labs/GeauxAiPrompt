@@ -298,18 +298,12 @@ body{
 [data-theme="light"] body{background-image:radial-gradient(ellipse 70% 40% at 50% 0%,#7c3aed12 0%,transparent 65%),radial-gradient(ellipse 40% 25% at 85% 75%,#0891b20e 0%,transparent 55%)}
 .shell{display:flex;flex-direction:column;min-height:100dvh;max-width:540px;margin:0 auto}
 
-/* Bottom control bar wrapper */
-.bot-bar{
-  position:fixed;bottom:0;left:0;right:0;max-width:540px;margin:0 auto;
-  z-index:25;
-  background:linear-gradient(0deg,var(--bg) 85%,transparent 120%);
-}
-/* Header (repositioned to bottom) */
+/* Header */
 .hd{
-  padding:6px 14px;
-  padding-bottom:max(8px,env(safe-area-inset-bottom,8px));
-  border-top:1px solid var(--edge);
-  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  position:sticky;top:0;z-index:20;
+  padding:10px 14px 8px;
+  background:linear-gradient(180deg,var(--bg) 75%,transparent);
+  display:flex;align-items:center;gap:8px;
 }
 .hd-brand{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
 .logo-img{width:32px;height:32px;flex-shrink:0;border-radius:9px;object-fit:contain;}
@@ -438,7 +432,7 @@ body{
 .thint{font-family:var(--mono);font-size:8.5px;color:var(--tx3)}
 
 /* Feed */
-.feed{flex:1;padding:12px 14px 165px;display:flex;flex-direction:column;gap:11px;overflow-y:auto}
+.feed{flex:1;padding:12px 14px 120px;display:flex;flex-direction:column;gap:11px;overflow-y:auto}
 
 /* Empty */
 .empty{
@@ -483,8 +477,9 @@ kbd{
 
 /* Footer */
 .ft{
-  padding:10px 14px 8px;
-  background:transparent;
+  position:fixed;bottom:0;left:0;right:0;max-width:540px;margin:0 auto;
+  padding:10px 14px;padding-bottom:max(14px,env(safe-area-inset-bottom,14px));
+  background:linear-gradient(0deg,var(--bg) 65%,transparent);
   display:flex;gap:8px;align-items:flex-end;
 }
 .ft-inp{
@@ -702,6 +697,27 @@ kbd{
 <body>
 <div class="shell">
 
+<header class="hd">
+  <div class="hd-brand">
+    <img src="/logo.png" class="logo-img" alt="GeauxAI Labs">
+    <div class="hd-text">
+      <div class="hd-name">GEAUXAI LABS / GEAUXAIPROMPT</div>
+    </div>
+  </div>
+  <div class="hd-right">
+    <div id="chip-status" class="chip chip-status ${statusChipClass}">${statusChipLabel}</div>
+    <button class="chip chip-tts${ttsEnabled ? '' : ' off'}" id="chip-tts" onclick="toggleTTS()">${ttsChipLabel}</button>
+    <button class="chip chip-engine" id="chip-engine" onclick="toggleTTSEngine()">${engineChipLabel}</button>
+    <form method="POST" action="/mic" style="margin:0">
+      <button type="submit" id="sse-mic" class="chip chip-mic${micMuted ? ' muted' : ''}">${micMuted ? '🔇 MUTED' : '🎤 MIC ON'}</button>
+    </form>
+    <form method="POST" action="/clear" style="margin:0">
+      <button type="submit" class="chip chip-x">✕ CLEAR</button>
+    </form>
+    <button class="chip chip-theme" id="chip-theme" onclick="toggleTheme()" title="Toggle light/dark theme">🌙</button>
+  </div>
+</header>
+
 <div class="sbar">
   <div class="sdot ${dotClass}"></div>
   <div class="stxt" id="stxt">${statusText}</div>
@@ -795,44 +811,22 @@ kbd{
 
 <div class="feed" id="feed">${bubbles}</div>
 
+<div class="ft-preview" id="ft-preview">
+  <img class="ft-prev-img" id="ft-prev-img" src="" alt="" style="display:none">
+  <span class="ft-prev-name" id="ft-prev-name"></span>
+  <button class="ft-prev-rm" id="ft-prev-rm" title="Remove file">✕</button>
+</div>
 <!-- TTS avatar -->
-<div id="av-wrap" style="position:fixed;bottom:120px;left:50%;transform:translateX(-50%);z-index:100;width:230px;height:230px;display:none;pointer-events:all;">
+<div id="av-wrap" style="position:fixed;bottom:90px;left:50%;transform:translateX(-50%);z-index:100;width:230px;height:230px;display:none;pointer-events:all;">
   <div id="tts-avatar"></div>
   <div id="av-close" onclick="window._avClose && window._avClose()">✕</div>
 </div>
-<div class="bot-bar">
-  <div class="ft-preview" id="ft-preview">
-    <img class="ft-prev-img" id="ft-prev-img" src="" alt="" style="display:none">
-    <span class="ft-prev-name" id="ft-prev-name"></span>
-    <button class="ft-prev-rm" id="ft-prev-rm" title="Remove file">✕</button>
-  </div>
-  <footer class="ft">
-    <input type="file" id="ft-file" accept="image/*,audio/*,.pdf,.txt" style="display:none">
-    <button class="ft-attach" id="ft-attach" title="Attach image, audio, or document">📎</button>
-    <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="10000" rows="1"></textarea>
-    <button class="ft-go" id="ft-go" title="Send">↑</button>
-  </footer>
-  <header class="hd">
-    <div class="hd-brand">
-      <img src="/logo.png" class="logo-img" alt="GeauxAI Labs">
-      <div class="hd-text">
-        <div class="hd-name">GEAUXAI LABS / GEAUXAIPROMPT</div>
-      </div>
-    </div>
-    <div class="hd-right">
-      <div id="chip-status" class="chip chip-status ${statusChipClass}">${statusChipLabel}</div>
-      <button class="chip chip-tts${ttsEnabled ? '' : ' off'}" id="chip-tts" onclick="toggleTTS()">${ttsChipLabel}</button>
-      <button class="chip chip-engine" id="chip-engine" onclick="toggleTTSEngine()">${engineChipLabel}</button>
-      <form method="POST" action="/mic" style="margin:0">
-        <button type="submit" id="sse-mic" class="chip chip-mic${micMuted ? ' muted' : ''}">${micMuted ? '🔇 MUTED' : '🎤 MIC ON'}</button>
-      </form>
-      <form method="POST" action="/clear" style="margin:0">
-        <button type="submit" class="chip chip-x">✕ CLEAR</button>
-      </form>
-      <button class="chip chip-theme" id="chip-theme" onclick="toggleTheme()" title="Toggle light/dark theme">🌙</button>
-    </div>
-  </header>
-</div>
+<footer class="ft">
+  <input type="file" id="ft-file" accept="image/*,audio/*,.pdf,.txt" style="display:none">
+  <button class="ft-attach" id="ft-attach" title="Attach image, audio, or document">📎</button>
+  <textarea class="ft-inp" id="ft-inp" placeholder="Type a prompt → sends to glasses…" maxlength="10000" rows="1"></textarea>
+  <button class="ft-go" id="ft-go" title="Send">↑</button>
+</footer>
 <div id="transcript-overlay" style="position:fixed;inset:0;z-index:500;background:var(--bg);display:flex;flex-direction:column;transform:translateY(100%);transition:transform 250ms ease;font-family:var(--mono);pointer-events:none;">
   <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--edge);background:var(--bg2);flex-shrink:0;">
     <span style="font-size:11px;font-weight:700;letter-spacing:.12em;color:var(--v3);">\uD83D\uDCCB TRANSCRIPTION LOG <span id="tlog-count" style="opacity:.6;font-weight:400;">(0)</span></span>
