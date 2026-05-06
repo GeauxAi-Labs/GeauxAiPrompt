@@ -25,7 +25,6 @@ const KOKORO_HOST   = process.env.KOKORO_HOST   || 'http://localhost:8880';
 const KOKORO_VOICE  = process.env.KOKORO_VOICE  || '';
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
 const CF_API_TOKEN  = process.env.CF_API_TOKEN  || '';
-const NV_API_KEY    = process.env.NV_API_KEY    || '';
 const MAX_HISTORY_PAIRS  = 10;   // keep last 10 user+assistant pairs (20 messages)
 const MAX_RESPONSE_CHARS = 8000; // cap runaway model output before display
 const MAX_DISPLAY_CHARS  = 8000; // pagination handles length — no artificial cut
@@ -41,7 +40,6 @@ interface GenParams {
   model:        string;  // empty string = use AI_MODEL from .env (server default)
   webSearch:    boolean;
   useCloudflare: boolean;
-  useNvidia: boolean;
   elevenLabsVoiceId: string;
   elevenDirectVoiceId:  string;
   elevenPathPref:    'mentraos' | 'geauxai';
@@ -90,7 +88,6 @@ const DEFAULT_GEN_PARAMS: GenParams = {
   model:        '',
   webSearch:    true,
   useCloudflare: false,
-  useNvidia: false,
   elevenLabsVoiceId: '',
   elevenDirectVoiceId: '',
   elevenPathPref:    'mentraos' as 'mentraos' | 'geauxai',
@@ -131,32 +128,6 @@ const CF_MODELS: string[] = [
 '@hf/google/gemma-7b-it',
 '@hf/nousresearch/hermes-2-pro-mistral-7b',
 '@cf/mistral/mistral-7b-instruct-v0.2-lora',
-];
-
-const NV_MODELS: string[] = [
-  'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'nvidia/llama-3.3-nemotron-super-49b-v1',
-  'nvidia/llama-3.1-nemotron-nano-8b-v1',
-  'meta/llama-4-maverick-17b-128e-instruct-fp8',
-  'meta/llama-4-scout-17b-16e-instruct',
-  'meta/llama-3.3-70b-instruct',
-  'meta/llama-3.1-70b-instruct',
-  'meta/llama-3.1-8b-instruct',
-  'deepseek-ai/deepseek-r1-0528',
-  'deepseek-ai/deepseek-r1',
-  'deepseek-ai/deepseek-v3-0324',
-  'mistralai/mixtral-8x7b-instruct-v0.1',
-  'mistralai/mistral-7b-instruct-v0.3',
-  'mistralai/mistral-nemo-12b-instruct',
-  'microsoft/phi-4',
-  'microsoft/phi-4-mini-instruct',
-  'qwen/qwen3-235b-a22b',
-  'qwen/qwen3-30b-a3b',
-  'qwen/qwen2.5-72b-instruct',
-  'google/gemma-3-27b-it',
-  'google/gemma-3-12b-it',
-  'moonshotai/kimi-k2-instruct',
-  'zhipuai/glm-4-32b',
 ];
 
 function getState(userId: string): UserState {
@@ -779,13 +750,6 @@ kbd{
       </div>
     </div>
     <div class="p-row">
-      <span class="p-lbl">NVIDIA NIM <span class="p-hint">— free cloud AI via build.nvidia.com (key: NV_API_KEY in .env)</span></span>
-      <div class="p-tog-row">
-        <label class="tsw"><input type="checkbox" id="p-nv"><span class="ttrack"></span></label>
-        <span class="thint" id="p-nv-hint">OFF — NVIDIA NIM disabled</span>
-      </div>
-    </div>
-    <div class="p-row">
       <span class="p-lbl">WEB SEARCH <span class="p-hint">— inject live results for current events &amp; facts</span></span>
       <div class="p-tog-row">
         <label class="tsw"><input type="checkbox" id="p-ws"><span class="ttrack"></span></label>
@@ -939,7 +903,6 @@ kbd{
         topP:parseFloat(topp.value),maxTokens:parseInt(mt.value,10)||2048,
         model:mdl?mdl.value:'',webSearch:ws?ws.checked:true,
         useCloudflare:cf?cf.checked:false,
-        useNvidia:document.getElementById('p-nv')?!!document.getElementById('p-nv').checked:false,
         elevenPathPref:document.getElementById('p-eleven-path')?document.getElementById('p-eleven-path').value:'mentraos',
         elevenLabsVoiceId:elevVoiceEl?elevVoiceEl.value:'',
         elevenDirectVoiceId:document.getElementById('p-eleven-direct-voice')?document.getElementById('p-eleven-direct-voice').value:'',
@@ -953,7 +916,7 @@ kbd{
 
   var pendingMdl='';
   function refreshModels(provider){
-    var url='/api/models'+(provider==='cloudflare'?'?provider=cloudflare':provider==='nvidia'?'?provider=nvidia':'');
+    var url='/api/models'+(provider==='cloudflare'?'?provider=cloudflare':'');
     fetch(url)
       .then(function(r){return r.ok?r.json():null;})
       .then(function(d){
@@ -1072,13 +1035,6 @@ kbd{
         // Refresh model list for the right provider
         refreshModels(d.useCloudflare?'cloudflare':'ollama');
       }
-      var nv=document.getElementById('p-nv');
-      var nvh=document.getElementById('p-nv-hint');
-      if(nv&&d.useNvidia!==undefined){
-        nv.checked=!!d.useNvidia;
-        if(nvh) nvh.textContent=d.useNvidia?'⚡ NVIDIA NIM — cloud AI models':'OFF — NVIDIA NIM disabled';
-        if(d.useNvidia) refreshModels('nvidia');
-      }
       refreshElevenVoices(d.elevenLabsVoiceId || '');
       refreshElevenDirectVoices(d.elevenDirectVoiceId || '');
       var _ep=document.getElementById('p-eleven-path'); if(_ep && d.elevenPathPref) _ep.value=d.elevenPathPref;
@@ -1122,16 +1078,6 @@ kbd{
     refreshModels(on?'cloudflare':'ollama');
     // Save immediately
     fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({useCloudflare:on,model:''})}).catch(function(){});
-  });
-  var nvEl=document.getElementById('p-nv'),nvhEl=document.getElementById('p-nv-hint');
-  if(nvEl) nvEl.addEventListener('change',function(){
-    var on=nvEl.checked;
-    if(nvhEl) nvhEl.textContent=on?'⚡ NVIDIA NIM — cloud AI models':'OFF — NVIDIA NIM disabled';
-    var mdlSel=document.getElementById('p-model');
-    if(mdlSel) mdlSel.value='';
-    pendingMdl='';
-    refreshModels(on?'nvidia':'ollama');
-    fetch('/api/params'+authQ,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({useNvidia:on,model:''})}).catch(function(){});
   });
   var mtEl=document.getElementById('p-maxtok');
   if(mtEl){mtEl.addEventListener('change',sendParams);mtEl.addEventListener('blur',sendParams);}
@@ -2395,8 +2341,6 @@ class GeauxAIApp extends AppServer {
         s.genParams.webSearch    = b.webSearch;
       if (typeof b.useCloudflare === 'boolean')
         s.genParams.useCloudflare = b.useCloudflare;
-      if (typeof b.useNvidia === 'boolean')
-        s.genParams.useNvidia = b.useNvidia;
       if (typeof b.elevenLabsVoiceId === 'string')
         s.genParams.elevenLabsVoiceId = b.elevenLabsVoiceId;
       if (typeof b.elevenDirectVoiceId === 'string')
@@ -2413,7 +2357,7 @@ class GeauxAIApp extends AppServer {
         s.genParams.avatarEnabled = b.avatarEnabled;
       if (typeof b.browserMicEnabled === 'boolean')
         s.genParams.browserMicEnabled = b.browserMicEnabled;
-      console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} nv=${s.genParams.useNvidia} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
+      console.log(`[Params] ${userId} temp=${s.genParams.temperature} topP=${s.genParams.topP} maxTok=${s.genParams.maxTokens} model="${s.genParams.model||'(default)'}" webSearch=${s.genParams.webSearch} cf=${s.genParams.useCloudflare} sys="${s.genParams.systemPrompt.slice(0,40)}"`);
       const sess = activeSessions.get(userId);
       if (sess) {
         updateDashboard(sess, 'Ready', undefined, s.history.length);
@@ -2430,9 +2374,6 @@ class GeauxAIApp extends AppServer {
       const provider = req.query?.provider;
       if (provider === 'cloudflare') {
         return res.json({ models: CF_MODELS, default: CF_MODELS[0] });
-      }
-      if (provider === 'nvidia') {
-        return res.json({ models: NV_MODELS, default: NV_MODELS[0] });
       }
       // Default: Ollama local models
       try {
@@ -2732,7 +2673,6 @@ async function loadUserPrefs(session: AppSession, userId: string): Promise<void>
       if (typeof prefs.genParams.maxTokens   === 'number') s.genParams.maxTokens    = prefs.genParams.maxTokens;
       if (prefs.genParams.model)                           s.genParams.model        = prefs.genParams.model;
       if (typeof prefs.genParams.useCloudflare === 'boolean') s.genParams.useCloudflare = prefs.genParams.useCloudflare;
-      if (typeof prefs.genParams.useNvidia === 'boolean') s.genParams.useNvidia = prefs.genParams.useNvidia;
       if (typeof prefs.genParams.elevenLabsVoiceId === 'string') s.genParams.elevenLabsVoiceId = prefs.genParams.elevenLabsVoiceId;
       if (typeof prefs.genParams.elevenDirectVoiceId === 'string') s.genParams.elevenDirectVoiceId = prefs.genParams.elevenDirectVoiceId;
       if (typeof prefs.genParams.kokoroVoice === 'string') s.genParams.kokoroVoice = prefs.genParams.kokoroVoice;
@@ -2880,33 +2820,7 @@ async function handleImagePrompt(
   try {
     let response = '';
 
-    if (state.genParams.useNvidia && NV_API_KEY) {
-      // NVIDIA NIM vision via OpenAI-compatible endpoint
-      const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${NV_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: state.genParams.model.trim() || 'meta/llama-4-maverick-17b-128e-instruct-fp8',
-          max_tokens: state.genParams.maxTokens,
-          messages: [
-            ...state.history,
-            {
-              role: 'user',
-              content: [
-                { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
-                { type: 'text', text: prompt },
-              ],
-            },
-          ],
-        }),
-      });
-      if (!r.ok) throw new Error(`NVIDIA NIM error ${r.status}`);
-      response = ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
-
-    } else if (state.genParams.useCloudflare && CF_ACCOUNT_ID && CF_API_TOKEN && (state.genParams.model.trim() || '').startsWith('@cf/')) {
+    if (state.genParams.useCloudflare && CF_ACCOUNT_ID && CF_API_TOKEN && (state.genParams.model.trim() || '').startsWith('@cf/')) {
       // Cloudflare vision via OpenAI-compatible endpoint
       const r = await fetch(
         `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1/chat/completions`,
@@ -3103,36 +3017,6 @@ async function callAI(history: { role: string; content: string }[], params: GenP
   const mainSystem = params.systemPrompt.trim() || DEFAULT_SYSTEM;
   // Use per-user selected model if set, otherwise fall back to server default.
   const modelToUse = params.model.trim() || AI_MODEL;
-
-  // ── NVIDIA NIM (OpenAI-compatible endpoint) ───────────────────────────────
-  if (params.useNvidia && NV_API_KEY && !modelToUse.startsWith('@cf/')) {
-    const nvSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
-    const messages = [{ role: 'system', content: nvSystem }, ...history];
-    const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${NV_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: modelToUse,
-        messages,
-        max_tokens: params.maxTokens,
-        temperature: params.temperature,
-        top_p: params.topP,
-        stream: false,
-      }),
-    });
-    if (!r.ok) {
-      const errBody = await r.text().catch(() => '');
-      let hint = '';
-      if (r.status === 401) hint = ' — Invalid NV_API_KEY in .env';
-      if (r.status === 403) hint = ' — Account missing "Public API Endpoints" permission, check build.nvidia.com';
-      if (r.status === 429) hint = ' — Rate limit hit, retry in ~60s';
-      throw new Error(`NVIDIA NIM error ${r.status}${hint}: ${errBody.substring(0, 200)}`);
-    }
-    return ((await r.json()) as any).choices?.[0]?.message?.content?.trim() || 'No response.';
-  }
 
   // ── Cloudflare Workers AI (OpenAI-compatible endpoint) ────────────────────
   // Only route to Cloudflare if the selected model is actually a CF model (@cf/...)
