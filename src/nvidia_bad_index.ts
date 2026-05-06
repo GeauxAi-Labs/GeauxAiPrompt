@@ -3105,12 +3105,7 @@ async function callAI(history: { role: string; content: string }[], params: GenP
   const modelToUse = params.model.trim() || AI_MODEL;
 
   // ── NVIDIA NIM (OpenAI-compatible endpoint) ───────────────────────────────
-  if (params.useNvidia && NV_API_KEY) {
-    // Use selected model only if it's NIM format (no colons — Ollama models use colons like "deepseek-v3.1:671b-cloud")
-    // If no model selected or an Ollama-format model is active, fall back to a reliable NIM default
-    const nvModel = (params.model.trim() && !params.model.trim().includes(':'))
-      ? params.model.trim()
-      : 'meta/llama-3.1-8b-instruct';
+  if (params.useNvidia && NV_API_KEY && !modelToUse.startsWith('@cf/')) {
     const nvSystem = searchContext ? searchContext + '\n\n' + mainSystem : mainSystem;
     const messages = [{ role: 'system', content: nvSystem }, ...history];
     const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
@@ -3120,7 +3115,7 @@ async function callAI(history: { role: string; content: string }[], params: GenP
         'Authorization': `Bearer ${NV_API_KEY}`,
       },
       body: JSON.stringify({
-        model: nvModel,
+        model: modelToUse,
         messages,
         max_tokens: params.maxTokens,
         temperature: params.temperature,
