@@ -2476,41 +2476,6 @@ class GeauxAIApp extends AppServer {
         return res.json({ models: CF_MODELS, default: CF_MODELS[0] });
       }
       if (provider === 'nvidia') {
-        // Try to fetch the live model list from NVIDIA's API — much more complete than hardcoded list
-        // Falls back to NV_MODELS if no key is set or the call fails
-        if (NV_API_KEY) {
-          try {
-            const nvr = await fetch('https://integrate.api.nvidia.com/v1/models', {
-              headers: { 'Authorization': `Bearer ${NV_API_KEY}` },
-              signal: AbortSignal.timeout(8000),
-            });
-            if (nvr.ok) {
-              const nvData = (await nvr.json()) as any;
-              const allModels: string[] = (nvData.data || []).map((m: any) => m.id as string);
-              // Filter to chat-capable LLMs only — exclude embeddings, ASR, image gen, video, safety, OCR, etc.
-              const EXCLUDE_PATTERNS = [
-                'embed', 'rerank', 'ocr', 'asr', 'parakeet', 'canary', 'speech',
-                'tts', 'voicechat', 'safety', 'guardrail', 'pii', 'gliner',
-                'flux', 'stable-diffusion', 'kolors', 'imagen',
-                'cosmos', 'trellis', 'streampetr', 'openfold', 'translate',
-                'active-speaker', 'lipsync', 'relighting', 'synthetic-video',
-                'ising-calibration', 'table-structure', 'page-elements',
-                'graphic-elements', 'nemoretriever', 'qwen-image',
-              ];
-              const chatModels = allModels.filter((id: string) => {
-                const lower = id.toLowerCase();
-                return !EXCLUDE_PATTERNS.some(p => lower.includes(p));
-              });
-              if (chatModels.length > 0) {
-                console.log(`[NVIDIA Models] Live fetch: ${chatModels.length} chat models`);
-                return res.json({ models: chatModels, default: chatModels[0] });
-              }
-            }
-          } catch (e: any) {
-            console.log(`[NVIDIA Models] Live fetch failed: ${e.message} — falling back to hardcoded list`);
-          }
-        }
-        // Fallback to hardcoded list (no API key set, or fetch failed)
         return res.json({ models: NV_MODELS, default: NV_MODELS[0] });
       }
       // Default: Ollama local models

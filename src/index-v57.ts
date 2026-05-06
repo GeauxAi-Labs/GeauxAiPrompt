@@ -134,73 +134,29 @@ const CF_MODELS: string[] = [
 ];
 
 const NV_MODELS: string[] = [
-  // ── NVIDIA Nemotron ───────────────────────────────────────────────────────
   'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'nvidia/nemotron-3-super-120b-a12b',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
   'nvidia/llama-3.3-nemotron-super-49b-v1',
-  'nvidia/nemotron-3-nano-30b-a3b',
-  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning',
-  'nvidia/nvidia-nemotron-nano-9b-v2',
   'nvidia/llama-3.1-nemotron-nano-8b-v1',
-  // ── Meta Llama ────────────────────────────────────────────────────────────
   'meta/llama-4-maverick-17b-128e-instruct-fp8',
   'meta/llama-4-scout-17b-16e-instruct',
   'meta/llama-3.3-70b-instruct',
   'meta/llama-3.1-70b-instruct',
   'meta/llama-3.1-8b-instruct',
-  // ── DeepSeek ─────────────────────────────────────────────────────────────
-  'deepseek-ai/deepseek-v4-pro',
-  'deepseek-ai/deepseek-v4-flash',
-  'deepseek-ai/deepseek-v3.2',
-  'deepseek-ai/deepseek-v3.1',
-  'deepseek-ai/deepseek-v3-0324',
   'deepseek-ai/deepseek-r1-0528',
   'deepseek-ai/deepseek-r1',
-  // ── Mistral AI ────────────────────────────────────────────────────────────
-  'mistralai/mistral-large-3-675b-instruct-2512',
-  'mistralai/mistral-medium-3.5-128b',
-  'mistralai/mistral-small-4-119b-2603',
-  'mistralai/devstral-2-123b-instruct-2512',
-  'mistralai/ministral-14b-instruct-2512',
-  'mistralai/mistral-nemo-12b-instruct',
+  'deepseek-ai/deepseek-v3-0324',
   'mistralai/mixtral-8x7b-instruct-v0.1',
   'mistralai/mistral-7b-instruct-v0.3',
-  // ── Qwen ─────────────────────────────────────────────────────────────────
-  'qwen/qwen3.5-397b-a17b',
-  'qwen/qwen3.5-122b-a10b',
-  'qwen/qwen3-coder-480b-a35b-instruct',
-  'qwen/qwen3-next-80b-a3b-thinking',
-  'qwen/qwen3-next-80b-a3b-instruct',
+  'mistralai/mistral-nemo-12b-instruct',
+  'microsoft/phi-4',
+  'microsoft/phi-4-mini-instruct',
   'qwen/qwen3-235b-a22b',
   'qwen/qwen3-30b-a3b',
   'qwen/qwen2.5-72b-instruct',
-  // ── Google Gemma ──────────────────────────────────────────────────────────
-  'google/gemma-4-31b-it',
   'google/gemma-3-27b-it',
   'google/gemma-3-12b-it',
-  // ── Moonshot / Kimi ───────────────────────────────────────────────────────
-  'moonshotai/kimi-k2.6',
-  'moonshotai/kimi-k2.5',
-  'moonshotai/kimi-k2-thinking',
   'moonshotai/kimi-k2-instruct',
-  // ── GLM / ZhipuAI ─────────────────────────────────────────────────────────
-  'z-ai/glm-5.1',
-  'z-ai/glm-4.7',
   'zhipuai/glm-4-32b',
-  // ── MiniMax ───────────────────────────────────────────────────────────────
-  'minimaxai/minimax-m2.7',
-  // ── OpenAI OSS (hosted on NIM) ────────────────────────────────────────────
-  'openai/gpt-oss-120b',
-  'openai/gpt-oss-20b',
-  // ── Microsoft Phi ─────────────────────────────────────────────────────────
-  'microsoft/phi-4',
-  'microsoft/phi-4-mini-instruct',
-  // ── ByteDance / StepFun / Sarvam / Stockmark ─────────────────────────────
-  'bytedance/seed-oss-36b-instruct',
-  'stepfun-ai/step-3.5-flash',
-  'sarvamai/sarvam-m',
-  'stockmark/stockmark-2-100b-instruct',
 ];
 
 function getState(userId: string): UserState {
@@ -2476,41 +2432,6 @@ class GeauxAIApp extends AppServer {
         return res.json({ models: CF_MODELS, default: CF_MODELS[0] });
       }
       if (provider === 'nvidia') {
-        // Try to fetch the live model list from NVIDIA's API — much more complete than hardcoded list
-        // Falls back to NV_MODELS if no key is set or the call fails
-        if (NV_API_KEY) {
-          try {
-            const nvr = await fetch('https://integrate.api.nvidia.com/v1/models', {
-              headers: { 'Authorization': `Bearer ${NV_API_KEY}` },
-              signal: AbortSignal.timeout(8000),
-            });
-            if (nvr.ok) {
-              const nvData = (await nvr.json()) as any;
-              const allModels: string[] = (nvData.data || []).map((m: any) => m.id as string);
-              // Filter to chat-capable LLMs only — exclude embeddings, ASR, image gen, video, safety, OCR, etc.
-              const EXCLUDE_PATTERNS = [
-                'embed', 'rerank', 'ocr', 'asr', 'parakeet', 'canary', 'speech',
-                'tts', 'voicechat', 'safety', 'guardrail', 'pii', 'gliner',
-                'flux', 'stable-diffusion', 'kolors', 'imagen',
-                'cosmos', 'trellis', 'streampetr', 'openfold', 'translate',
-                'active-speaker', 'lipsync', 'relighting', 'synthetic-video',
-                'ising-calibration', 'table-structure', 'page-elements',
-                'graphic-elements', 'nemoretriever', 'qwen-image',
-              ];
-              const chatModels = allModels.filter((id: string) => {
-                const lower = id.toLowerCase();
-                return !EXCLUDE_PATTERNS.some(p => lower.includes(p));
-              });
-              if (chatModels.length > 0) {
-                console.log(`[NVIDIA Models] Live fetch: ${chatModels.length} chat models`);
-                return res.json({ models: chatModels, default: chatModels[0] });
-              }
-            }
-          } catch (e: any) {
-            console.log(`[NVIDIA Models] Live fetch failed: ${e.message} — falling back to hardcoded list`);
-          }
-        }
-        // Fallback to hardcoded list (no API key set, or fetch failed)
         return res.json({ models: NV_MODELS, default: NV_MODELS[0] });
       }
       // Default: Ollama local models
